@@ -1,0 +1,16 @@
+[package]
+name = "auth_wal-benchmark"
+version = "0.1.0"
+edition = "2024"
+description = "firewood-style workloads (create, tenkrandom, zipf, single) against auth_wal (design §11)"
+
+[[bin]]
+name = "auth_wal-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+auth_wal = { path = "..", features = ["lthash", "merkle"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+rand = "0.9"
+rand_distr = "0.5"

@@ -1,6 +1,31 @@
+[workspace]
+members = [".", "benchmark"]
+
 [package]
 name = "auth_wal"
 version = "0.1.0"
 edition = "2024"
+description = "Authenticated, bounded, in-memory set of recent writes between EVM validators and an authenticated storage engine"
+
+[lib]
+# rlib for Rust consumers (benchmark, tests); staticlib for the C ABI / Go `ffi`
+# package, exactly as qmdb-ffi is linked.
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["lthash"]
+lthash = []
+merkle = []
+kzg = []
+ffi = ["lthash"]
 
 [dependencies]
+im = "15"
+sha2 = "0.10"
+blake3 = "1"
+parking_lot = "0.12"
+thiserror = "2"
+
+[profile.release]
+# Must stay "unwind": the C ABI converts panics into errors (see qmdb-ffi docs/01).
+panic = "unwind"
