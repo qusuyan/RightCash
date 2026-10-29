@@ -1,13 +1,14 @@
 //! Lattice hash (design §7.2, v0 default): additively homomorphic,
-//! `C <- C - H(k, old) + H(k, new)` over 1024 u16 lanes. Authenticates the set
-//! as a whole; no per-key proofs.
+//! `C <- C - H(k, old) + H(k, new)` over 1024 u16 lanes, an item being the
+//! §7.2 entry item (`tag || key || value`). Authenticates the set as a whole;
+//! no per-key proofs.
 
 use crate::lattice::{LANES, LatticeAccumulator};
-use crate::set::{Entry, PersistentMap};
+use crate::set::Entry;
 use crate::types::{Digest, Key, Value};
-use crate::vc::{Proof, VectorCommitment};
+use crate::vc::VectorCommitment;
 
-const TAG: &[u8] = b"auth_wal/lthash";
+const TAG: &str = "auth_wal/lthash";
 
 /// Parameter-free scheme.
 #[derive(Clone, Default)]
@@ -31,10 +32,6 @@ impl<K: Key, V: Value> VectorCommitment<K, V> for LtHash {
         "lthash"
     }
 
-    fn params_digest(&self) -> Digest {
-        [0u8; 32]
-    }
-
     fn empty(&self) -> Self::State {
         LtHashState {
             acc: LatticeAccumulator::new(TAG),
@@ -47,17 +44,5 @@ impl<K: Key, V: Value> VectorCommitment<K, V> for LtHash {
 
     fn commitment(&self, state: &Self::State) -> Digest {
         state.acc.digest()
-    }
-
-    fn supports_proofs(&self) -> bool {
-        false
-    }
-
-    fn prove(&self, state: &Self::State, set: &PersistentMap<K, Entry<V>>, key: &K) -> Option<Proof> {
-        None
-    }
-
-    fn verify(&self, commitment: &Digest, key: &K, entry: Option<&Entry<V>>, proof: &Proof) -> bool {
-        false
     }
 }

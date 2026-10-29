@@ -1,13 +1,14 @@
-//! `tenkrandom` workload (design §11). Per batch: delete 2,500 rows from `low`, insert 2,500 from `high`, update 5,000 from the midpoint; then advance both by 2,500. Exercises Put/Delete mixes and tombstones.
+//! `tenkrandom` workload (design §11), firewood's: per batch, insert
+//! `batch_size/4` new rows from `high`, delete `batch_size/4` rows from `low`,
+//! update `batch_size/2` rows from the midpoint with `sha256(low)`; then
+//! advance both by `batch_size/4`. Exercises Put/Delete mixes and tombstones.
 
 use std::error::Error;
 
-use auth_wal::policy::EvictionPolicy;
-use auth_wal::storage::MemoryStorage;
-use auth_wal::vc::VectorCommitment;
-
 use crate::report::Measurements;
-use crate::{Args, BenchDb, BenchKey, BenchValue, TestRunner};
+use crate::target::Target;
+use crate::workload::{Clock, Recorder, apply, deletes, inserts, row_key, updates};
+use crate::{Args, TestRunner};
 
 #[derive(Clone, Default)]
 pub struct TenKRandom;
@@ -15,19 +16,25 @@ pub struct TenKRandom;
 impl TestRunner for TenKRandom {
     const NAME: &'static str = "tenkrandom";
 
-    fn run<C, P>(&self, db: &BenchDb<C, P>, args: &Args) -> Result<Measurements, Box<dyn Error>>
-    where
-        C: VectorCommitment<BenchKey, BenchValue>,
-        P: EvictionPolicy<BenchKey>,
-    {
-        todo!("design §11 tenkrandom")
-    }
-
-    fn run_baseline(
-        &self,
-        db: &MemoryStorage<BenchKey, BenchValue>,
-        args: &Args,
-    ) -> Result<Measurements, Box<dyn Error>> {
-        todo!("design §11 tenkrandom baseline")
+    fn run(&self, target: &mut dyn Target, args: &Args) -> Result<Measurements, Box<dyn Error>> {
+        let g = &args.global_opts;
+        let quarter = g.batch_size / 4;
+        let mut low = 0u64;
+        let mut high = g.rows();
+        let mut rec = Recorder::new(Self::NAME, args);
+        let mut clock = Clock::new(args);
+        loop {
+            let ops = inserts(high, quarter)
+                .chain(deletes(low, quarter))
+                .chain(updates(low + high / 2, quarter * 2, row_key(low).to_vec()))
+                .collect();
+            apply(target, args, &mut rec, ops)?;
+            low += quarter;
+            high += quarter;
+            if clock.tick() {
+                break;
+            }
+        }
+        Ok(rec.finish(target.stats()))
     }
 }

@@ -1,35 +1,37 @@
 //! Benchmark driver modelled on `firewood/benchmark` (design §11).
 //!
-//! Same four workloads and key derivation (`sha256(row_id)`), plus auth_wal
-//! knobs. Prints a CSV header and one record per run so sweeps can be plotted
-//! directly.
-
-// Skeleton phase: bodies are `todo!()`, so parameters are unused for now.
-#![allow(dead_code, unused_variables)]
+//! Same four workloads and key derivation (`sha256(row_id)`), the same
+//! inherited flags, plus auth_wal knobs. Every run prints a CSV header and one
+//! record to stdout (progress goes to stderr), so sweeps over capacity,
+//! policy, speculation and hints can be plotted directly.
+//!
+//! Targets: `--baseline` runs the workload straight into a storage engine
+//! (`--engine memory` or `--engine firewood`, the vanilla comparison point);
+//! without it the workload runs through auth_wal, which lands with
+//! milestone 1.
 
 use std::error::Error;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use auth_wal::AuthWal;
-use auth_wal::policy::EvictionPolicy;
-use auth_wal::storage::MemoryStorage;
-use auth_wal::vc::VectorCommitment;
+use auth_wal::storage::{MemoryConfig, MemoryStorage};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod create;
 mod report;
 mod single;
+mod target;
 mod tenkrandom;
+mod workload;
 mod zipf;
+
+use target::{Baseline, Target};
 
 /// Key and value types used by every workload: 32-byte SHA-256 digests, as in
 /// firewood's benchmark.
 pub type BenchKey = [u8; 32];
 pub type BenchValue = Vec<u8>;
-
-/// The instantiation every workload runs against; the engine is fixed, the
-/// scheme and policy are chosen from the CLI.
-pub type BenchDb<C, P> = AuthWal<BenchKey, BenchValue, C, P, MemoryStorage<BenchKey, BenchValue>>;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -44,21 +46,57 @@ pub struct GlobalOpts {
     // ---- inherited from firewood/benchmark ----
     #[arg(short, long, default_value_t = 10_000)]
     pub batch_size: u64,
-    #[arg(short, long, default_value_t = 1_000)]
+    #[arg(
+        short,
+        long,
+        default_value_t = 1_000,
+        help = "Batches for `create`; also N rows for tenkrandom/zipf"
+    )]
     pub number_of_batches: u64,
-    #[arg(short, long, default_value_t = 128)]
+    #[arg(short, long, default_value_t = 128, help = "Revision window K")]
     pub revisions: usize,
     #[arg(short = 't', long, default_value_t = 65, help = "Terminate after this many minutes")]
     pub duration_minutes: u64,
+    #[arg(short, long, default_value_t = NonZeroUsize::new(192_000_000).expect("non-zero"), help = "Firewood node cache bytes")]
+    pub cache_memory_limit: NonZeroUsize,
+    #[arg(
+        short,
+        long,
+        default_value = "auth_wal_benchmark_db",
+        help = "Firewood database directory"
+    )]
+    pub dbname: PathBuf,
+
+    // ---- run control ----
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Batches to run for tenkrandom/zipf/single (0 = until the duration elapses)"
+    )]
+    pub iterations: u64,
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "Progress line to stderr every this many batches (0 = never)"
+    )]
+    pub progress_every: u64,
+    #[arg(long, value_enum, default_value_t = EngineArg::Memory)]
+    pub engine: EngineArg,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run the workload straight into the storage engine, no write set"
+    )]
+    pub baseline: bool,
 
     // ---- auth_wal knobs (design §11) ----
     #[arg(
         long,
-        default_value_t = 1_000_000,
-        help = "Write-set capacity in entries (100 firewood batches)"
+        default_value_t = 10_000,
+        help = "Write-set capacity in entries (R16; sweep 1k..1M)"
     )]
     pub capacity: usize,
-    #[arg(long, help = "Eviction low watermark; default capacity - capacity/8 (design §6.2)")]
+    #[arg(long, help = "Eviction low watermark; default capacity / 2 (design §6.2)")]
     pub low_watermark: Option<usize>,
     #[arg(long, value_enum, default_value_t = PolicyArg::LruWrite)]
     pub policy: PolicyArg,
@@ -73,21 +111,15 @@ pub struct GlobalOpts {
     #[arg(
         long,
         default_value_t = 3,
-        help = "Maximum speculative links per parent (design §9.2)"
+        help = "Maximum speculative steps per precomputation (design §9.2)"
     )]
     pub speculation_rounds: u32,
     #[arg(
         long,
         default_value_t = 1_000,
-        help = "Minimum new predicted entries before a link is sent (design §9.2)"
+        help = "Minimum pending ops before the worker builds a step ahead of the flush (design §9.2)"
     )]
-    pub speculation_min_link: usize,
-    #[arg(
-        long,
-        default_value_t = 16,
-        help = "Instance-wide budget of live speculative links (design §9.2)"
-    )]
-    pub speculation_max_links: usize,
+    pub speculation_min_step: usize,
     #[arg(
         long,
         default_value_t = 0,
@@ -109,27 +141,34 @@ pub struct GlobalOpts {
     #[arg(
         long,
         default_value_t = 0,
-        help = "Synthetic per-op latency of the in-memory storage engine"
+        help = "Synthetic per-op latency of the in-memory storage engine, microseconds"
     )]
     pub storage_latency_us: u64,
     #[arg(long, default_value_t = 1.2, help = "Zipf exponent (firewood default)")]
     pub zipf_exponent: f64,
-    #[arg(long, default_value_t = 0, help = "RNG seed for zipf and tenkrandom")]
+    #[arg(long, default_value_t = 0, help = "RNG seed for zipf")]
     pub seed: u64,
     #[arg(long, default_value_t = 0, help = "Batches to run before measuring (zipf)")]
     pub warmup_batches: u64,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Run the workload straight into the storage engine, no write set"
-    )]
-    pub baseline: bool,
 }
 
 impl GlobalOpts {
     pub fn storage_latency(&self) -> Duration {
         Duration::from_micros(self.storage_latency_us)
     }
+
+    /// Rows in the database for tenkrandom/zipf, as in firewood.
+    pub fn rows(&self) -> u64 {
+        self.number_of_batches * self.batch_size
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EngineArg {
+    /// In-memory model of firewood (design §10).
+    Memory,
+    /// Vanilla firewood (design §10, R13).
+    Firewood,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -144,7 +183,7 @@ pub enum VcArg {
     Merkle,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
 pub enum TestName {
     /// Insert N rows, `batch_size` per commit: pure eviction throughput.
     Create,
@@ -156,45 +195,58 @@ pub enum TestName {
     Single,
 }
 
-/// A workload, generic over the scheme and policy chosen from the CLI. A
-/// runner returns measurements only; `run_test` fills the configuration
-/// columns of the report. With `--hints`, a runner splits each batch into
-/// `hint_chunks` chunks and calls `Prefetch` with each chunk's keys before
-/// `Propose`, timing the hint path separately.
+/// A workload. A runner returns measurements only; `run_test` fills the
+/// configuration columns of the report.
 pub trait TestRunner {
     const NAME: &'static str;
 
-    fn run<C, P>(&self, db: &BenchDb<C, P>, args: &Args) -> Result<report::Measurements, Box<dyn Error>>
-    where
-        C: VectorCommitment<BenchKey, BenchValue>,
-        P: EvictionPolicy<BenchKey>;
-
-    /// `--baseline`: the same workload against the bare engine.
-    fn run_baseline(
-        &self,
-        db: &MemoryStorage<BenchKey, BenchValue>,
-        args: &Args,
-    ) -> Result<report::Measurements, Box<dyn Error>>;
+    fn run(&self, target: &mut dyn Target, args: &Args) -> Result<report::Measurements, Box<dyn Error>>;
 }
 
-/// `sha256(row_id)` in native endian, as firewood does.
-pub fn row_key(row: u64) -> BenchKey {
-    todo!("design §11 key derivation")
+fn build_target(args: &Args) -> Result<Box<dyn Target>, Box<dyn Error>> {
+    let g = &args.global_opts;
+    if !g.baseline {
+        return Err("the auth_wal target lands with milestone 1 (design §13); run with --baseline for now".into());
+    }
+    match g.engine {
+        EngineArg::Memory => {
+            let engine = MemoryStorage::<BenchKey, BenchValue>::new(MemoryConfig {
+                revisions: g.revisions,
+                op_latency: g.storage_latency(),
+            });
+            Ok(Box::new(Baseline::new(engine, "memory")))
+        }
+        #[cfg(feature = "firewood")]
+        EngineArg::Firewood => {
+            use auth_wal::storage::{FirewoodConfig, FirewoodStorage};
+            let mut cfg = FirewoodConfig::new(g.dbname.clone());
+            // `create` starts from scratch; the other workloads run on the
+            // database `create` left behind, as in firewood's benchmark.
+            cfg.truncate = args.test_name == TestName::Create;
+            cfg.revisions = g.revisions;
+            cfg.node_cache_bytes = g.cache_memory_limit;
+            cfg.free_list_cache_entries =
+                NonZeroUsize::new(4 * g.batch_size as usize).unwrap_or(NonZeroUsize::new(1).expect("non-zero"));
+            let engine = FirewoodStorage::new(cfg)?;
+            Ok(Box::new(Baseline::new(engine, "firewood")))
+        }
+        #[cfg(not(feature = "firewood"))]
+        EngineArg::Firewood => Err("built without the `firewood` feature".into()),
+    }
 }
 
-/// Static dispatch over the CLI's (vc, policy) choice: builds the engine and
-/// `BenchDb<C, P>` for each of the 2x2 combinations and runs `runner` (or
-/// the baseline against the bare engine), then fills the configuration
-/// columns. `TestRunner::run` is generic, so the trait is not
-/// dyn-compatible; `main` matches on `TestName` instead, as firewood's does.
 fn run_test<R: TestRunner>(runner: &R, args: &Args) -> Result<report::Report, Box<dyn Error>> {
-    todo!(
-        "match (args.global_opts.vc, args.global_opts.policy); --baseline -> run_baseline; Report from measurements + config"
-    )
+    let mut target = build_target(args)?;
+    let measurements = runner.run(&mut *target, args)?;
+    target.finish()?;
+    Ok(report::Report::new(R::NAME, target.name(), args, measurements))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if args.test_name == TestName::Single && args.global_opts.batch_size > 1000 {
+        return Err("single is not designed for batch sizes > 1000 (as in firewood)".into());
+    }
     let report = match args.test_name {
         TestName::Create => run_test(&create::Create, &args)?,
         TestName::TenKRandom => run_test(&tenkrandom::TenKRandom, &args)?,

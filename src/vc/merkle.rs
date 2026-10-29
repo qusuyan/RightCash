@@ -1,12 +1,12 @@
 //! Sparse Merkle tree reference scheme (design §7.2): slow but proof-friendly
 //! baseline for tests and benchmarks. Leaves are addressed by `SHA-256(key)`
 //! at depth 256 (no slots, no collisions, parameter-free); a leaf hashes the
-//! §7.2 entry item. The state is the whole (persistent) tree, since
-//! `apply(old, new)` must recompute a path.
+//! §7.2 entry item. The state is the whole (persistent) tree, cloned with the
+//! snapshot in O(1), since `apply(old, new)` must recompute a path.
 
-use crate::set::{Entry, PersistentMap};
+use crate::set::Entry;
 use crate::types::{Digest, Key, Value};
-use crate::vc::{Proof, VectorCommitment};
+use crate::vc::VectorCommitment;
 
 /// Parameter-free: depth is fixed at 256.
 #[derive(Clone, Default)]
@@ -35,10 +35,6 @@ impl<K: Key, V: Value> VectorCommitment<K, V> for Merkle {
         "merkle"
     }
 
-    fn params_digest(&self) -> Digest {
-        [0u8; 32]
-    }
-
     fn empty(&self) -> Self::State {
         todo!()
     }
@@ -49,17 +45,5 @@ impl<K: Key, V: Value> VectorCommitment<K, V> for Merkle {
 
     fn commitment(&self, state: &Self::State) -> Digest {
         state.root
-    }
-
-    fn supports_proofs(&self) -> bool {
-        true
-    }
-
-    fn prove(&self, state: &Self::State, set: &PersistentMap<K, Entry<V>>, key: &K) -> Option<Proof> {
-        todo!("membership and non-membership paths")
-    }
-
-    fn verify(&self, commitment: &Digest, key: &K, entry: Option<&Entry<V>>, proof: &Proof) -> bool {
-        todo!()
     }
 }

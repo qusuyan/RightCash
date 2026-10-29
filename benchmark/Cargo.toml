@@ -2,15 +2,21 @@
 name = "auth_wal-benchmark"
 version = "0.1.0"
 edition = "2024"
-description = "firewood-style workloads (create, tenkrandom, zipf, single) against auth_wal (design §11)"
+description = "firewood-style workloads (create, tenkrandom, zipf, single) against auth_wal and bare storage engines (design §11)"
 
 [[bin]]
 name = "auth_wal-benchmark"
 path = "src/main.rs"
 
+[features]
+default = ["firewood"]
+# Vanilla firewood as a target (design §11 baseline, R13).
+firewood = ["auth_wal/firewood"]
+ethhash = ["auth_wal/ethhash"]
+
 [dependencies]
-auth_wal = { path = "..", features = ["lthash", "merkle"] }
+auth_wal = { path = ".." }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
-rand = "0.9"
-rand_distr = "0.5"
+rand = "0.10"
+rand_distr = "0.6"

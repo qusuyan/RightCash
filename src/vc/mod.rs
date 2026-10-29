@@ -3,46 +3,38 @@
 //! The trait is incremental: every scheme updates its state from
 //! `(old, new)` for one key, so per-block cost is proportional to the batch,
 //! not the set. Methods take `&self` because a scheme instance carries its
-//! parameters (KZG trusted setup, Merkle depth).
+//! parameters (KZG trusted setup, Merkle depth). Proof methods arrive with
+//! milestone 5 (design §7.4).
 
-#[cfg(feature = "kzg")]
-pub mod kzg;
-#[cfg(feature = "lthash")]
 pub mod lthash;
-#[cfg(feature = "merkle")]
 pub mod merkle;
 
-use crate::set::{Entry, PersistentMap};
+use crate::set::Entry;
 use crate::types::{Digest, Key, Value};
 
-/// Opaque, scheme-specific proof bytes (design §7.4).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Proof(pub Vec<u8>);
-
 pub trait VectorCommitment<K: Key, V: Value>: Clone + Send + Sync + 'static {
-    /// Commitment state carried by every snapshot; must be cheap to clone.
+    /// Commitment state of the set at a node; copied with the snapshot at
+    /// every proposal (design §4), so it must be cheap to clone.
     type State: Clone + Send + Sync;
 
     /// Identifier hashed into the root preimage (design §7.3).
     fn scheme_id(&self) -> &'static str;
 
-    /// Digest of the instance parameters (KZG setup hash and slot count,
-    /// Merkle depth; zeros for lthash). Enters the root preimage (design §7.3).
-    fn params_digest(&self) -> Digest;
+    /// Digest of the instance parameters (a KZG setup hash and slot count,
+    /// later). Enters the root preimage (design §7.3). Zeros for a
+    /// parameter-free scheme, the default (both v0 schemes).
+    fn params_digest(&self) -> Digest {
+        [0u8; 32]
+    }
 
     fn empty(&self) -> Self::State;
 
-    /// Incremental update for one key. `None` means absent.
+    /// Incremental update for one key. An item is the entry under its key
+    /// (design §7.2); the policy state is a root term of its own (design
+    /// §7.3, R25). `None` means absent; `old` is the item the set held
+    /// before the op (design §4 batch semantics).
     fn apply(&self, state: &mut Self::State, key: &K, old: Option<&Entry<V>>, new: Option<&Entry<V>>);
 
     /// 32-byte digest of the state, used in the root.
     fn commitment(&self, state: &Self::State) -> Digest;
-
-    /// Whether `prove` can return `Some` (design §7.4).
-    fn supports_proofs(&self) -> bool;
-
-    /// Membership / non-membership proof, if the scheme supports one.
-    fn prove(&self, state: &Self::State, set: &PersistentMap<K, Entry<V>>, key: &K) -> Option<Proof>;
-
-    fn verify(&self, commitment: &Digest, key: &K, entry: Option<&Entry<V>>, proof: &Proof) -> bool;
 }

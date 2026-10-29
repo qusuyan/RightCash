@@ -1,8 +1,14 @@
-//! The write set: a copy-on-write ordered map of recent writes with its
-//! commitment and eviction-policy state (design §4).
+//! The write set (design §4, R20): every proposal owns a complete
+//! `Snapshot`, a copy of its parent's with the batch applied, policy state
+//! and commitment included. Nothing is mutated once shared, except the
+//! policy's prediction marks behind their lock (design §9.2, R26), so reads
+//! take no lock and need no chain (design §5).
 
-use crate::policy::EvictionPolicy;
-use crate::speculate::Pred;
+use std::collections::BTreeMap;
+
+use parking_lot::Mutex;
+
+use crate::policy::{EvictionPolicy, Prediction};
 use crate::types::{BatchOp, Digest, Key, Value};
 use crate::vc::VectorCommitment;
 
@@ -14,214 +20,160 @@ pub enum Entry<V> {
     Tombstone,
 }
 
-/// Persistent (structurally shared) **ordered** map: O(1) snapshot, O(log n)
-/// update, iteration in key order on every node, range scans for prefix
-/// deletes. Wraps the backing crate so it can be swapped without touching
-/// callers (design §4).
-#[derive(Clone)]
-pub struct PersistentMap<K, V> {
-    inner: im::OrdMap<K, V>,
+/// Entries in key order: the evicted entries of `Snapshot::apply` (design
+/// §6.3); `speculate::entries_to_ops` turns them into a storage batch.
+pub(crate) type Entries<K, V> = Vec<(K, Entry<V>)>;
+
+/// The whole write set at one node (design §4): entries, policy state and
+/// commitment at `height`. Immutable once built and shared by `Arc` through
+/// its node (design §8); `Snapshot::apply` builds a child's as a copy with
+/// the batch applied. The one exception is the policy's prediction marks,
+/// which hints write through `hint_writes` (design §9.2).
+pub(crate) struct Snapshot<K, V, C, P>
+where
+    K: Key,
+    V: Value,
+    C: VectorCommitment<K, V>,
+    P: EvictionPolicy<K>,
+{
+    /// Ordered: canonical iteration, no hasher.
+    entries: BTreeMap<K, Entry<V>>,
+    /// Policy state as of this node (design §6.1), copied with the entries.
+    /// Behind a mutex because hints mark predictions in it while the node is
+    /// the precomputation's target (design §9.2, R26): the writer alone
+    /// takes it (hints, `apply`'s clone, a retarget's reset), serialised by
+    /// `&mut self`, so it is never contended; readers never touch it.
+    policy: Mutex<P>,
+    /// `policy.state_digest()` as of this node, a root preimage term (design
+    /// §7.3), computed once when the snapshot is built.
+    policy_digest: Digest,
+    /// Scheme instance (parameters) and the incremental commitment of `entries`.
+    vc: C,
+    commitment: C::State,
+    height: u64,
+    /// Maximum number of entries, tombstones included (design §6.2): the
+    /// capacity in force at this node, a consensus parameter today and
+    /// per-node state once it adapts (R4, design §12.8); a root preimage
+    /// term of the node (design §7.3, R23).
+    capacity: usize,
 }
 
-impl<K: Key, V: Clone> PersistentMap<K, V> {
-    pub fn new() -> Self {
+impl<K, V, C, P> Snapshot<K, V, C, P>
+where
+    K: Key,
+    V: Value,
+    C: VectorCommitment<K, V>,
+    P: EvictionPolicy<K>,
+{
+    /// Empty set at height 0 with `capacity` in force.
+    pub fn genesis(vc: C, policy: P, capacity: usize) -> Self {
+        let commitment = vc.empty();
+        let policy_digest = policy.state_digest();
         Self {
-            inner: im::OrdMap::new(),
+            entries: BTreeMap::new(),
+            policy: Mutex::new(policy),
+            policy_digest,
+            vc,
+            commitment,
+            height: 0,
+            capacity,
         }
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.inner.get::<K>(key)
-    }
-
-    /// Returns the previous value, if any.
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.inner.insert(key, value)
-    }
-
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.inner.remove::<K>(key)
-    }
-
     pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Entries in key order.
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.inner.iter()
-    }
-
-    /// Keys whose bytes start with `prefix`, in key order (design §3 PrefixDelete).
-    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<K> {
-        todo!("range scan from the first key >= prefix while key.as_ref().starts_with(prefix)")
-    }
-}
-
-impl<K: Key, V: Clone> Default for PersistentMap<K, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One snapshot of the write set. Cloning is cheap (persistent map, small
-/// commitment state, persistent policy state) and is how proposals copy on
-/// write (design §4, §8).
-#[derive(Clone)]
-pub struct WriteSet<K, V, C, P>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-{
-    entries: PersistentMap<K, Entry<V>>,
-    /// Entries including tombstones; kept separately so a byte-based or
-    /// adaptive capacity can replace it later (design §6.4).
-    len: usize,
-    /// Scheme instance: carries parameters such as a KZG setup (design §7.1).
-    vc: C,
-    /// Incremental commitment of `entries`.
-    commitment: C::State,
-    /// Per-snapshot policy state.
-    policy: P,
-    /// Block height: 0 for genesis, `parent.height + 1` for every proposal.
-    /// The only notion of time in the set (design §4).
-    height: u64,
-}
-
-/// Result of `WriteSet::apply`: what left the set plus the batch summary the
-/// node keeps for statistics and for the round-0 speculation estimate
-/// (design §9.2, §11).
-pub struct Applied<K, V> {
-    pub evicted: Evicted<K, V>,
-    pub puts: usize,
-    /// Puts whose key was not in the set before the batch.
-    pub new_keys: usize,
-    /// Puts that replaced an entry already in the set.
-    pub in_place_updates: usize,
-    pub deletes: usize,
-    pub prefix_deletes: usize,
-}
-
-/// What left the set while applying one batch, in the canonical storage-batch
-/// order of design §6.3: prefix deletes first (batch order), then evicted
-/// entries sorted by key. Empty on both counts means no storage proposal.
-pub struct Evicted<K, V> {
-    pub prefix_deletes: Vec<Box<[u8]>>,
-    pub entries: Vec<(K, Entry<V>)>,
-}
-
-impl<K, V> Evicted<K, V> {
-    pub fn is_empty(&self) -> bool {
-        self.prefix_deletes.is_empty() && self.entries.is_empty()
-    }
-
-    /// The storage batch in canonical order (design §6.3): `PrefixDelete`
-    /// ops, then `speculate::entries_to_ops(entries)`.
-    pub fn into_batch(self) -> Vec<BatchOp<K, V>> {
-        todo!("PrefixDelete ops, then entries_to_ops")
-    }
-}
-
-impl<K, V, C, P> WriteSet<K, V, C, P>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-{
-    /// Empty set at height 0.
-    pub fn genesis(vc: C, policy: P) -> Self {
-        todo!("design §4")
-    }
-
-    /// Copy-on-write child at `height + 1` (design §8 Propose).
-    pub fn child(&self) -> Self {
-        todo!("clone + height += 1")
-    }
-
-    /// Applies `batch` in order, then evicts down to `low_watermark` if the
-    /// set exceeds `capacity`. The single entry point used by both
-    /// `AuthWal::propose` and `Proposal::propose` (design §4, §6.2).
-    pub fn apply(&mut self, batch: Vec<BatchOp<K, V>>, capacity: usize, low_watermark: usize) -> Applied<K, V> {
-        todo!("put/delete/prefix_delete in order, counting, then evict")
-    }
-
-    /// Looks a key up in this snapshot only (design §5 step 1).
-    pub fn get(&self, key: &K) -> Option<&Entry<V>> {
-        self.entries.get(key)
-    }
-
-    /// Predicted victims (design §9.2): `policy.likely_victims(n)` with this
-    /// snapshot's entries, sorted by key. Costs `n` lookups.
-    pub fn pred(&self, n: usize) -> Pred<K, V> {
-        todo!("design §9.2")
-    }
-
-    /// `pred` skipping keys execution is known to be writing this block
-    /// (`policy.likely_victims_excluding`, design §9.2/§9.4).
-    pub fn pred_excluding(&self, n: usize, exclude: &std::collections::BTreeSet<K>) -> Pred<K, V> {
-        todo!("design §9.2")
-    }
-
-    /// Inserts or updates in place, feeding the commitment and the policy.
-    fn put(&mut self, key: K, value: V) {
-        todo!("design §4 update in place; §7.1 apply; §6.1 on_write")
-    }
-
-    /// Records a tombstone (counts toward capacity).
-    fn delete(&mut self, key: K) {
-        todo!("design §4 tombstones")
-    }
-
-    /// Removes matching entries via a range scan; returns them so the caller
-    /// can account for them. The prefix itself is forwarded to storage.
-    fn prefix_delete(&mut self, prefix: &[u8]) -> Vec<(K, Entry<V>)> {
-        todo!("keys_with_prefix, remove each, vc.apply(old -> None), policy.on_remove")
-    }
-
-    /// Evicts down to `low_watermark` if `len > capacity`; victims come from
-    /// `policy.select_victims`, which removes them from policy state itself.
-    fn evict(&mut self, capacity: usize, low_watermark: usize) -> Vec<(K, Entry<V>)> {
-        todo!("design §6.2; result sorted by key")
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.len()
     }
 
     pub fn height(&self) -> u64 {
         self.height
     }
 
-    /// Set commitment, one of the root preimage terms (design §7.3).
+    /// The capacity in force at this node (design §6.2).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Design §5 step 1: one lookup.
+    pub fn get(&self, key: &K) -> Option<&Entry<V>> {
+        self.entries.get::<K>(key)
+    }
+
+    /// Set commitment, a root preimage term (design §7.3).
     pub fn commitment(&self) -> Digest {
         self.vc.commitment(&self.commitment)
     }
 
-    /// Policy digest, one of the root preimage terms (design §7.3).
+    /// The policy's state digest, a root preimage term (design §7.3).
     pub fn policy_digest(&self) -> Digest {
-        self.policy.digest()
+        self.policy_digest
     }
 
-    pub fn policy(&self) -> &P {
-        &self.policy
+    /// A prefetch hint on this node (design §9.2): `policy.hint_writes(keys,
+    /// capacity, margin)` under the policy lock. Local; the consensus state
+    /// is untouched.
+    pub fn hint_writes(&self, keys: &[K], margin: usize) -> Prediction<K> {
+        self.policy.lock().hint_writes(keys, self.capacity, margin)
     }
 
-    pub fn vc(&self) -> &C {
-        &self.vc
+    /// A retarget to this node (design §9.2): the policy forgets its marks,
+    /// since nothing marked is in the new precomputation's storage.
+    pub fn reset_hints(&self) {
+        self.policy.lock().reset_hints();
     }
 
-    pub fn entries(&self) -> &PersistentMap<K, Entry<V>> {
-        &self.entries
+    /// Design §8 Propose and §4 batch semantics: the child's snapshot is a
+    /// copy of this one (entries, policy, commitment, capacity; about 2 ms
+    /// at 10k, design §4; the policy is cloned under its lock and carries
+    /// this node's marks, design §9.2) at `height + 1` with `batch` applied
+    /// **in order**: `Put`/`Delete` insert the entry (a tombstone for
+    /// `Delete`) and update the commitment with `vc.apply(k, old,
+    /// Some(new))`, `old` what the copy held before the op (design §7.2);
+    /// `batch` holds no `PrefixDelete` (`propose` rejected it, design §4;
+    /// one here is a caller bug, `unreachable!`). Then the policy: `ev =
+    /// policy.writes(&keys, height, capacity)` with the batch's keys in
+    /// batch order (design §6.1), after which every key of `ev.evicted` is
+    /// removed from the copy (`vc.apply(k, Some(old), None)`; a key the
+    /// policy names that the set lacks is a policy bug, `unreachable!`) and
+    /// collected into `evicted`, sorted by key (design §6.3), and
+    /// `assert!(entries.len() <= capacity)` holds the policy to its contract
+    /// (design §6.2: a violation halts rather than diverges). `refinement`
+    /// is `ev.refinement` with both lists sorted by key (design §9.1).
+    /// Finally `policy_digest = policy.state_digest()` (one hash over the
+    /// order, design §7.3). The summary counts puts and puts of present keys
+    /// (`in_place_updates`, design §11).
+    pub fn apply(&self, batch: Vec<BatchOp<K, V>>) -> Applied<K, V, C, P> {
+        todo!("design §4 batch semantics, §6.1 writes, §6.2 eviction")
     }
+}
+
+/// Counts of one batch application, consumed by `propose` for the
+/// statistics (design §9.5, §11).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AppliedSummary {
+    pub puts: usize,
+    /// Puts of a key present at the time of the op (a key put twice in one
+    /// batch counts here the second time).
+    pub in_place_updates: usize,
+}
+
+/// Result of `Snapshot::apply`: the child's snapshot, what left the set,
+/// the policy's last refinement of its prediction (design §9.1), and the
+/// counts.
+pub(crate) struct Applied<K, V, C, P>
+where
+    K: Key,
+    V: Value,
+    C: VectorCommitment<K, V>,
+    P: EvictionPolicy<K>,
+{
+    pub snapshot: Snapshot<K, V, C, P>,
+    /// What left the set, in key order (design §6.3); empty means no storage
+    /// proposal on the plain path.
+    pub evicted: Entries<K, V>,
+    /// `evict`: the keys of `evicted` storage does not hold yet (the final
+    /// proposal writes these and omits the rest); `retract`: keys a step
+    /// wrote that stayed in the set (the final proposal puts their storage
+    /// value back). Both in key order; the plain path ignores it.
+    pub refinement: Prediction<K>,
+    pub summary: AppliedSummary,
 }

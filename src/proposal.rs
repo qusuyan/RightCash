@@ -1,148 +1,50 @@
-//! Proposal tree, pinned storage views, commit/drop and the revision window
-//! (design §5, §8).
+//! Nodes, handles and the registry (design §5, §8).
 //!
 //! ```text
 //! committed --> P1 --> P2        (chain: block building)
 //!          \--> P1'              (sibling: competing block)
 //! ```
 //!
-//! Lock order: the tree lock (`Shared.inner`) is taken first, then a node's
-//! speculative-chain mutex, then a node's `parent` link, then the engine.
-//! Dropping a `Proposal` or `Revision` handle takes no lock: it decrements
-//! the shared live-handle counter (lock-free, for `close`) and releases its
-//! reference. The root index holds weak links and sweeps dead ones when
-//! nodes are registered or retired, never on lookup (design §8 Drop).
+//! A `Node` is the immutable record of one proposal (design §8, R20): its
+//! snapshot (the whole set after its batch), its pinned storage view, the
+//! number of speculative steps under it, its root with the metadata hash
+//! that entered it, and one weak link to its parent. Nothing in it is written
+//! after construction, so the writer, the worker and the reader threads
+//! share it freely and every read is one lookup with no lock (design §5,
+//! §10). Committed-ness is registry membership: the `Registry` is the K-ring
+//! of committed nodes in commit order (its newest entry is the head) and the
+//! live index, nothing else, behind the one mutex (`Shared.registry`); every
+//! hold is a few pointer operations or a scan of the ring (design §10). A
+//! [`Handle`] is the caller's newtype over a node and holds nothing else.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
-use parking_lot::Mutex;
-
-use crate::Shared;
 use crate::policy::EvictionPolicy;
-use crate::proof::AuthProof;
-use crate::root::RootPreimage;
-use crate::set::{Applied, WriteSet};
-use crate::speculate::{ChainSlot, StoragePath};
-use crate::storage::{ReadView, StorageEngine, ViewRef};
-use crate::types::{BatchOp, Hash, Key, Result, Value};
+use crate::set::Snapshot;
+use crate::storage::StorageEngine;
+use crate::types::{Digest, Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
-pub type NodeRef<K, V, C, P, S> = Arc<Node<K, V, C, P, S>>;
-pub type WeakNode<K, V, C, P, S> = Weak<Node<K, V, C, P, S>>;
-/// A node's parent link; only touched under the tree lock.
-pub type ParentLink<K, V, C, P, S> = Mutex<Option<NodeRef<K, V, C, P, S>>>;
-/// Root -> live/retained nodes (design §8 root index).
-pub type RootIndex<K, V, C, P, S> = HashMap<Hash, Vec<WeakNode<K, V, C, P, S>>>;
-/// Uncommitted ancestors oldest-first, ending with the node to commit.
-pub type Chain<K, V, C, P, S> = Vec<NodeRef<K, V, C, P, S>>;
-/// The speculative chain slot of a node acting as a parent (design §9.2);
-/// local state, behind its own mutex. `Retired` is terminal.
-pub type Speculation<K, V, S> = Mutex<ChainSlot<K, V, S>>;
+pub(crate) type NodeRef<K, V, C, P, S> = Arc<Node<K, V, C, P, S>>;
+pub(crate) type WeakNode<K, V, C, P, S> = Weak<Node<K, V, C, P, S>>;
+/// The storage view a node reads through after its own set (design §5): the
+/// proposal created by the nearest ancestor-or-self that created one (design
+/// §6.3, §9.1), otherwise the committed handle that chain started from
+/// (`StorageEngine::head` for the genesis node). Always a proposal handle (design §10 item 7), so
+/// proposing on it is one call whatever its state (item 4) and it stays
+/// readable across commits (item 2).
+pub(crate) type StorageView<K, V, S> = Arc<<S as StorageEngine<K, V>>::Proposal>;
+/// The live index's entries (`Registry::live`): root and height cached
+/// beside the weak link, so a lookup compares roots and a retirement
+/// compares heights without upgrading (nothing is dropped under the hold,
+/// design §10). An alias because the inline type trips clippy's
+/// type-complexity lint.
+pub(crate) type LiveIndex<K, V, C, P, S> = Vec<(Hash, u64, WeakNode<K, V, C, P, S>)>;
 
-/// The storage view a node reads through after its own write set (design §5):
-/// the proposal created by the nearest ancestor-or-self that evicted, or the
-/// committed revision that chain started from. Stays valid across commits
-/// because `StorageProposal::commit(&self)` leaves the handle readable.
-pub enum StorageView<K, V, S>
-where
-    K: Key,
-    V: Value,
-    S: StorageEngine<K, V>,
-{
-    Proposal(Arc<S::Proposal>),
-    Revision(Arc<S::Revision>),
-}
-
-impl<K, V, S> Clone for StorageView<K, V, S>
-where
-    K: Key,
-    V: Value,
-    S: StorageEngine<K, V>,
-{
-    fn clone(&self) -> Self {
-        match self {
-            Self::Proposal(p) => Self::Proposal(p.clone()),
-            Self::Revision(r) => Self::Revision(r.clone()),
-        }
-    }
-}
-
-impl<K, V, S> ReadView<K, V> for StorageView<K, V, S>
-where
-    K: Key,
-    V: Value,
-    S: StorageEngine<K, V>,
-{
-    fn root(&self) -> Hash {
-        match self {
-            Self::Proposal(p) => p.root(),
-            Self::Revision(r) => r.root(),
-        }
-    }
-
-    fn get(&self, key: &K) -> Result<Option<V>> {
-        match self {
-            Self::Proposal(p) => p.get(key),
-            Self::Revision(r) => r.get(key),
-        }
-    }
-}
-
-impl<K, V, S> StorageView<K, V, S>
-where
-    K: Key,
-    V: Value,
-    S: StorageEngine<K, V>,
-{
-    /// Proposes `batch` on this view (design §6.3, §10 contract item 4): a
-    /// `Proposal` with `!is_committed()` chains on it; a `Revision` or a
-    /// committed `Proposal` routes through `engine.propose` after checking
-    /// `self.root() == engine.root()` (auth_wal is the engine's sole writer),
-    /// returning `ProposalOrphaned` rather than panicking if it does not hold
-    /// (the hint path treats that as a dropped link, design §9.2). The
-    /// decision uses `is_committed`, never the root comparison, because an
-    /// uncommitted proposal can be a storage no-op with the engine's root.
-    pub fn propose(&self, engine: &S, batch: &[BatchOp<K, V>], metadata: Option<&[u8]>) -> Result<S::Proposal> {
-        todo!("design §10 contract item 4")
-    }
-
-    /// Borrowed, engine-typed form for `StorageEngine::prefetch`.
-    pub fn as_ref(&self) -> ViewRef<'_, K, V, S> {
-        match self {
-            Self::Proposal(p) => ViewRef::Proposal(&**p),
-            Self::Revision(r) => ViewRef::Revision(&**r),
-        }
-    }
-}
-
-/// The counts of `Applied` without the evicted entries (which went to storage).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AppliedSummary {
-    pub puts: usize,
-    pub new_keys: usize,
-    pub in_place_updates: usize,
-    pub deletes: usize,
-    pub prefix_deletes: usize,
-    pub evicted: usize,
-}
-
-impl<K, V> From<&Applied<K, V>> for AppliedSummary {
-    fn from(a: &Applied<K, V>) -> Self {
-        Self {
-            puts: a.puts,
-            new_keys: a.new_keys,
-            in_place_updates: a.in_place_updates,
-            deletes: a.deletes,
-            prefix_deletes: a.prefix_deletes,
-            evicted: a.evicted.entries.len(),
-        }
-    }
-}
-
-/// One node of the tree.
-pub struct Node<K, V, C, P, S>
+/// One node of the tree: one proposal, immutable from construction (design
+/// §8, R20).
+pub(crate) struct Node<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -150,38 +52,31 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    set: WriteSet<K, V, C, P>,
-    /// Pinned storage view (design §5).
+    /// The whole set after this node's batch (design §4): what reads look up
+    /// and what a child copies.
+    snapshot: Snapshot<K, V, C, P>,
+    /// The parent this node was proposed on (design §8): the one link a node
+    /// has. Weak, retaining nothing but the parent's inline allocation; dead
+    /// once the parent was dropped uncommitted, after which this node can
+    /// never be committed (`Commit` requires the parent to be the head).
+    parent: WeakNode<K, V, C, P, S>,
+    /// Pinned storage view (design §5): the proposal this node created (its
+    /// batch evicted, design §6.3: the plain proposal, or
+    /// the final proposal `F` of the speculative path), else the parent's,
+    /// the same `Arc`. `Commit` tells the two apart by identity with the
+    /// head's view (design §8).
     storage_view: StorageView<K, V, S>,
-    /// The storage proposal this node itself created, if its batch evicted or
-    /// prefix-deleted (design §6.3): the plain proposal, or the final
-    /// proposal `F` of the speculative path, whose ancestors are the links.
-    /// Committed when the node commits.
-    own_storage: Option<Arc<S::Proposal>>,
-    /// How the eviction reached storage; counted at commit (design §9.5).
-    storage_path: StoragePath,
-    /// Batch summary from `WriteSet::apply`, for `Stats` and the round-0
-    /// speculation estimate at commit (design §9.2).
-    applied: AppliedSummary,
-    /// Speculative chain slot for children of this node (design §9.2). Local
-    /// state: created by prefetch hints or round 0 after commit, shared by
-    /// all children; retired by `ProposalTree::advance` when the node stops
-    /// being the head or by a failed orphan check, dropped with the node
-    /// (the chain's `Drop` releases the link budget either way).
-    speculation: Speculation<K, V, S>,
-    /// The exact preimage `root` was computed from (design §7.3): built from
-    /// the *effective* consensus parameters at construction, so it is
-    /// reproducible for proofs (§7.4) after a capacity-controller change, and
-    /// never sees the local part of the configuration.
-    preimage: RootPreimage,
-    /// `root::combine(&preimage)`, cached.
+    /// Speculative steps the node's own storage proposal chains on (`F` on
+    /// `S1..Sk`, design §9.1); 0 for a plain proposal or an inherited view.
+    /// A failed engine commit poisons the instance iff this is non-zero
+    /// (design §9.2).
+    steps: u32,
+    /// `SHA-256(metadata)` or zeros (design §7.3): the one preimage term not
+    /// derivable from the node and the writer's `root::Terms`, kept so a
+    /// proof (design §7.4) can rebuild the preimage.
+    metadata_hash: Digest,
+    /// `root::Terms::combine` over the node's terms, computed by `propose`.
     root: Hash,
-    /// `Release` on commit, `Acquire` on read; checked under the tree lock
-    /// where the answer matters (`chain_to_commit`).
-    committed: AtomicBool,
-    /// Cleared on commit so freed snapshots are reclaimed (design §8).
-    /// Only touched under the tree lock.
-    parent: ParentLink<K, V, C, P, S>,
 }
 
 impl<K, V, C, P, S> Node<K, V, C, P, S>
@@ -192,55 +87,85 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    pub fn root(&self) -> Hash {
+    /// A live node (design §8 Propose); `root` is `Terms::combine` of the
+    /// writer's terms and this node's own, computed by `propose`.
+    pub(crate) fn new(
+        snapshot: Snapshot<K, V, C, P>,
+        parent: WeakNode<K, V, C, P, S>,
+        storage_view: StorageView<K, V, S>,
+        steps: u32,
+        metadata_hash: Digest,
+        root: Hash,
+    ) -> NodeRef<K, V, C, P, S> {
+        todo!("design §8 Propose")
+    }
+
+    /// The genesis node (design §8, §7.3): the empty set at height 0, no
+    /// parent (a dead weak link), the engine's `head()` as its view (design
+    /// §10 item 7), no storage proposal, no steps, zero metadata hash, root
+    /// `EMPTY_ROOT` (what `combine` gives any height-0 preimage).
+    pub(crate) fn genesis(
+        snapshot: Snapshot<K, V, C, P>,
+        storage_view: StorageView<K, V, S>,
+    ) -> NodeRef<K, V, C, P, S> {
+        todo!("design §8 genesis; debug_assert!(snapshot.height() == 0 && snapshot.len() == 0)")
+    }
+
+    pub(crate) fn root(&self) -> Hash {
         self.root
     }
 
-    pub fn height(&self) -> u64 {
-        self.set.height()
+    pub(crate) fn height(&self) -> u64 {
+        self.snapshot.height()
     }
 
-    pub fn set(&self) -> &WriteSet<K, V, C, P> {
-        &self.set
+    /// The whole set at this node (design §4).
+    pub(crate) fn snapshot(&self) -> &Snapshot<K, V, C, P> {
+        &self.snapshot
     }
 
-    pub fn storage_view(&self) -> &StorageView<K, V, S> {
+    /// Design §5: the snapshot (`Value` is the value, `Tombstone` is absent
+    /// and stops), then the pinned storage view, which returns
+    /// `RevisionStale` once the engine dropped its root. No lock.
+    pub(crate) fn get(&self, key: &K) -> Result<Option<V>> {
+        todo!("design §5")
+    }
+
+    /// Whether `node` is this node's parent (pointer identity on the weak
+    /// link, no upgrade): the precomputation's retarget rule (design §9.2).
+    pub(crate) fn parent_is(&self, node: &NodeRef<K, V, C, P, S>) -> bool {
+        std::ptr::eq(self.parent.as_ptr(), Arc::as_ptr(node))
+    }
+
+    pub(crate) fn storage_view(&self) -> &StorageView<K, V, S> {
         &self.storage_view
     }
 
-    pub fn storage_root(&self) -> Hash {
-        self.preimage.storage_root
-    }
-
-    pub fn storage_path(&self) -> StoragePath {
-        self.storage_path
-    }
-
-    pub fn applied(&self) -> AppliedSummary {
-        self.applied
-    }
-
-    /// The speculative chain attached to this node as a parent (design §9.2).
-    pub fn speculation(&self) -> &Speculation<K, V, S> {
-        &self.speculation
-    }
-
-    /// Write set first, then the pinned storage view (design §5).
-    pub fn get(&self, key: &K) -> Result<Option<V>> {
-        todo!("set.get -> Value/Tombstone, else storage_view.get")
-    }
-
-    /// The preimage this node's `root` was computed from (design §7.3).
-    pub fn preimage(&self) -> &RootPreimage {
-        &self.preimage
+    /// Speculative steps under this node's storage proposal (design §9.1);
+    /// 0 on the plain path or with an inherited view.
+    pub(crate) fn steps(&self) -> u32 {
+        self.steps
     }
 }
 
-/// Handle returned to callers; mirrors the `ffi` `Proposal`. Holds a strong
-/// reference to its node; dropping the handle decrements the live-handle
-/// counter and releases the reference (design §8 Drop): the node is freed
-/// when the last reference goes.
-pub struct Proposal<K, V, C, P, S>
+/// The caller's handle over a node (design §8): what `Propose` returns and
+/// what `Revision(root)` resolves to; qmdb-ffi's `Proposal` and `Revision`
+/// are both this type. Read-only (`get`, `root`); committing it,
+/// proposing on it and hinting through it are writer operations that take
+/// the handle as an argument (`AuthWal::commit(&mut self, handle)` consumes
+/// it, design §3, R19). A plain newtype: no counter, no flag (the Go layer
+/// counts its outstanding handles, R20). `Send + Sync`; dropping it releases
+/// the node, which is freed when no handle and no ring entry holds it (the
+/// precomputation and the live index hold it weakly, design §8).
+pub struct Handle<K, V, C, P, S>(NodeRef<K, V, C, P, S>)
+where
+    K: Key,
+    V: Value,
+    C: VectorCommitment<K, V>,
+    P: EvictionPolicy<K>,
+    S: StorageEngine<K, V>;
+
+impl<K, V, C, P, S> Handle<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -248,62 +173,34 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    node: NodeRef<K, V, C, P, S>,
-    db: Arc<Shared<K, V, C, P, S>>,
-}
-
-impl<K, V, C, P, S> Proposal<K, V, C, P, S>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-    S: StorageEngine<K, V>,
-{
-    /// Only `Shared::propose_on` builds handles. Counts the handle for
-    /// `close` (design §3); `Drop` undoes it.
-    pub(crate) fn new(node: NodeRef<K, V, C, P, S>, db: Arc<Shared<K, V, C, P, S>>) -> Self {
-        db.live_handles.fetch_add(1, Ordering::AcqRel);
-        Self { node, db }
+    pub(crate) fn new(node: NodeRef<K, V, C, P, S>) -> Self {
+        Self(node)
     }
 
-    /// The single combined commitment, known before commit (design §7.3).
+    pub(crate) fn node(&self) -> &NodeRef<K, V, C, P, S> {
+        &self.0
+    }
+
+    /// The single combined commitment (design §7.3), known before commit.
     pub fn root(&self) -> Hash {
-        self.node.root
+        self.0.root
     }
 
+    /// Design §5: one lookup in the node's snapshot, then its pinned storage
+    /// view. No lock.
     pub fn get(&self, key: &K) -> Result<Option<V>> {
-        self.node.get(key)
-    }
-
-    /// Prefetch hint relative to this proposal (design §9.4, R14): execution
-    /// building on it is writing `keys`. Advisory; an orphaned proposal only
-    /// warms storage.
-    pub fn prefetch(&self, keys: &[K]) {
-        self.db.prefetch_on(crate::Parent::Node(&self.node), keys)
-    }
-
-    /// Child proposal on top of this uncommitted one (design §8 Propose).
-    pub fn propose(&self, batch: Vec<BatchOp<K, V>>) -> Result<Self> {
-        self.propose_with_metadata(batch, None)
-    }
-
-    pub fn propose_with_metadata(&self, batch: Vec<BatchOp<K, V>>, metadata: Option<&[u8]>) -> Result<Self> {
-        todo!("db.propose_on(Parent::Node(&self.node), batch, metadata)")
-    }
-
-    /// Commits uncommitted ancestors oldest-first, then this node; consumes
-    /// the handle. `ProposalOrphaned` if the chain does not start at the
-    /// committed node; `ProposalConsumed` if already committed; `Poisoned`
-    /// after a failed mid-chain engine commit (design §8, §9.2). Round 0 of
-    /// speculation for the new head runs here, after `commit_node` has
-    /// released the tree lock.
-    pub fn commit(self) -> Result<Hash> {
-        todo!("let (root, job) = db.commit_node(&self.node)?; db.round0(job); Ok(root)")
+        self.0.get(key)
     }
 }
 
-impl<K, V, C, P, S> Drop for Proposal<K, V, C, P, S>
+/// The registry (design §8): the K-ring of committed nodes and the live
+/// index, nothing else (the statistics are atomics on `Shared`). The one
+/// structure the writer changes and readers read, behind `Shared.registry`
+/// (design §10: every hold is a few pointer operations or a scan of the
+/// ring, never an engine call, a snapshot copy or a drop; retired entries
+/// are handed back to be dropped after the hold). The committed set is the
+/// head's snapshot.
+pub(crate) struct Registry<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -311,15 +208,32 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    fn drop(&mut self) {
-        self.db.live_handles.fetch_sub(1, Ordering::AcqRel);
-    }
+    /// The last K committed nodes in commit order, oldest first (design §8
+    /// revision window); the newest is the **head**, so there is no head
+    /// field. Never empty: the head stays until the instance is dropped (its
+    /// pinned view does not keep the engine from closing, design §10 item 6;
+    /// `close` leaves the ring alone, R22). Committed roots are
+    /// pairwise distinct (height is in the preimage); a lookup by root scans
+    /// from the newest entry, at most K root compares (design §10).
+    ring: VecDeque<NodeRef<K, V, C, P, S>>,
+    /// The live index (design §8): the live proposals as (root, height, weak
+    /// link) triples, so a lookup compares roots and a retirement compares
+    /// heights without upgrading; a short list
+    /// (the blocks being verified ahead and the competing candidates), weak
+    /// because the caller's handle owns the node. It exists because
+    /// `Revision(root)` must resolve a live proposal's root (qmdb-ffi's
+    /// `Database.Revision` and firewood's `view` do; the adapter's
+    /// `Reader(root)` opens the state of an unaccepted block this way, and
+    /// its hints reach the precomputation through the same lookup, design
+    /// §9.4), which nothing else answers. Equal roots are interchangeable
+    /// (design §7.3) but two distinct live nodes may share one and either
+    /// may be dropped, so `lookup` returns the first still alive; dead links
+    /// are dropped by `register`/`advance`. Lookup-only: never iterated for
+    /// anything consensus-visible.
+    live: LiveIndex<K, V, C, P, S>,
 }
 
-/// Read-only view at a root: a live proposal or one of the last K commits.
-/// Just a node (design §8); `get` reads through the pinned storage view and
-/// surfaces `RevisionStale` if the engine has dropped that root.
-pub struct Revision<K, V, C, P, S>
+impl<K, V, C, P, S> Registry<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -327,142 +241,53 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    node: NodeRef<K, V, C, P, S>,
-    db: Arc<Shared<K, V, C, P, S>>,
-}
-
-impl<K, V, C, P, S> Revision<K, V, C, P, S>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-    S: StorageEngine<K, V>,
-{
-    /// Only `AuthWal::revision` builds handles. Counts the handle for
-    /// `close` (design §3); `Drop` undoes it.
-    pub(crate) fn new(node: NodeRef<K, V, C, P, S>, db: Arc<Shared<K, V, C, P, S>>) -> Self {
-        db.live_handles.fetch_add(1, Ordering::AcqRel);
-        Self { node, db }
+    /// Genesis (design §8, §7.3): `genesis` is `Node::genesis`, root
+    /// `EMPTY_ROOT`; it enters the ring, so `revision(EMPTY_ROOT)` resolves
+    /// on a fresh instance (design §3) until it leaves the K-ring. Both lists
+    /// are pre-sized (the ring to `revisions + 1`, the live index to a few
+    /// entries) so neither an install nor a register allocates; `revisions`
+    /// itself is not kept (`advance` takes it).
+    pub fn new(genesis: NodeRef<K, V, C, P, S>, revisions: usize) -> Self {
+        todo!("ring: VecDeque::with_capacity(revisions + 1) holding genesis; live: Vec::with_capacity(16)")
     }
 
-    pub fn root(&self) -> Hash {
-        self.node.root
+    /// The newest committed node (design §8): the committed set is its
+    /// snapshot, `Propose(None)` builds on it and `Commit` requires it as the
+    /// parent.
+    pub fn head(&self) -> &NodeRef<K, V, C, P, S> {
+        self.ring.back().expect("the ring always holds the head")
     }
 
-    pub fn get(&self, key: &K) -> Result<Option<V>> {
-        self.node.get(key)
-    }
-
-    /// Prefetch hint relative to this revision (design §9.4, R14): execution
-    /// building on it is writing `keys`. This is where the adapter's
-    /// finalise-time hook lands, since execution reads through a revision at
-    /// the parent root. Advisory; a retained non-head revision only warms
-    /// storage.
-    pub fn prefetch(&self, keys: &[K]) {
-        self.db.prefetch_on(crate::Parent::Node(&self.node), keys)
-    }
-
-    /// Authenticated read (design §7.4): `Unsupported` when the scheme has no
-    /// per-key proofs (`lthash`). Milestone 6.
-    pub fn prove(&self, key: &K) -> Result<AuthProof<V>> {
-        todo!("design §7.4")
-    }
-}
-
-impl<K, V, C, P, S> Drop for Revision<K, V, C, P, S>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-    S: StorageEngine<K, V>,
-{
-    fn drop(&mut self) {
-        self.db.live_handles.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// The tree: committed node, K-ring of committed nodes (strong), and a
-/// root index over live proposals (weak) and history.
-pub struct ProposalTree<K, V, C, P, S>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-    S: StorageEngine<K, V>,
-{
-    /// Never empty: `close` clears `history` but the committed node (and its
-    /// pinned engine view) lives until the instance is dropped.
-    committed: NodeRef<K, V, C, P, S>,
-    /// Last K committed nodes, newest last (includes `committed`).
-    history: VecDeque<NodeRef<K, V, C, P, S>>,
-    /// Root -> nodes. Equal roots are interchangeable (design §7.3) but two
-    /// distinct live nodes may share one and either may be dropped, so this
-    /// is a list of weak links; `lookup` returns the first still alive and
-    /// dead links are swept by `register`/`advance`. Lookup-only: never
-    /// iterated for anything consensus-visible.
-    by_root: RootIndex<K, V, C, P, S>,
-    revisions: usize,
-}
-
-impl<K, V, C, P, S> ProposalTree<K, V, C, P, S>
-where
-    K: Key,
-    V: Value,
-    C: VectorCommitment<K, V>,
-    P: EvictionPolicy<K>,
-    S: StorageEngine<K, V>,
-{
-    /// Genesis: the empty set at height 0 over the engine's committed state;
-    /// root `EMPTY_ROOT`, but the genesis preimage still records `effective`
-    /// so a child can read its parameters back from `parent.preimage`. The
-    /// genesis node is pushed on `history` and registered, so
-    /// `revision(EMPTY_ROOT)` resolves on a fresh instance (design §3, §7.3)
-    /// until it leaves the K-ring.
-    pub fn new(
-        genesis: WriteSet<K, V, C, P>,
-        storage: StorageView<K, V, S>,
-        effective: crate::Effective,
-        revisions: usize,
-    ) -> Self {
-        todo!()
-    }
-
-    pub fn committed(&self) -> &NodeRef<K, V, C, P, S> {
-        &self.committed
-    }
-
-    /// First live node with this root, if any (design §8 root index).
+    /// Design §8 lookup order: the ring first (the committed node, scanned
+    /// newest first), then the first live node still alive under `root`. No
+    /// mutation.
     pub fn lookup(&self, root: Hash) -> Option<NodeRef<K, V, C, P, S>> {
-        todo!("upgrade weak links in order; no mutation under the read lock")
+        todo!("ring.iter().rev().find(root), else upgrade the live triples with that root in order")
     }
 
-    /// Idempotent: a node already present (e.g. committed after its handle
-    /// was dropped) is not duplicated. Sweeps dead links in the same bucket.
+    /// Adds a live node to the index (design §8 Propose, second hold; once
+    /// per node, `propose` is the only caller) after dropping the dead
+    /// links, so the list stays bounded by the live proposals.
     pub fn register(&mut self, node: &NodeRef<K, V, C, P, S>) {
-        todo!()
+        todo!("retain strong_count > 0; push (root, height, downgrade)")
     }
 
-    /// Uncommitted ancestors of `node` oldest-first, including `node`.
-    /// `ProposalConsumed` if `node` is committed; `ProposalOrphaned` if the
-    /// chain does not end at `committed` (pointer equality) (design §8).
-    pub fn chain_to_commit(&self, node: &NodeRef<K, V, C, P, S>) -> Result<Chain<K, V, C, P, S>> {
-        todo!()
-    }
-
-    /// Makes `node` the committed state: marks it, clears its parent link,
-    /// (re)registers it, pushes it on the ring, and retires the oldest beyond
-    /// K, removing the retired node from `by_root`. Every K commits it also
-    /// sweeps the whole index of dead links (dropped, never-committed
-    /// proposals have unique roots nothing else revisits); the index is
-    /// bounded by K plus live proposals, so this is O(K) amortised (design §8).
-    /// Retires the previous head's chain slot (`ChainSlot::retire`): an
-    /// ex-head can never be a parent again and its links would otherwise pin
-    /// engine revisions for K commits (design §9.2); the chain's `Drop`
-    /// releases the budget and counts it unused if no child built on it.
-    pub fn advance(&mut self, node: NodeRef<K, V, C, P, S>) {
-        todo!()
+    /// Makes `node` the head (design §8 Commit): it is pushed on the ring and
+    /// leaves the live index by identity, along with any dead link and any
+    /// entry `revisions` or more heights below the new head (one window for
+    /// both lists, R22, `h + revisions > head.height()` on the cached height,
+    /// no upgrade: such a node, if still held, stays readable but no longer
+    /// resolves by root; the ring answers for the committed root, so
+    /// `lookup` there finds the committed node, not a live sibling sharing
+    /// the root); with the ring
+    /// over `revisions` entries the oldest is popped and **returned for the
+    /// caller to drop after releasing the lock** (its snapshot and engine
+    /// view go with it unless a handle still holds it; the precomputation
+    /// holds its target weakly, design §8).
+    #[must_use = "drop the retired node after releasing the registry lock"]
+    pub fn advance(&mut self, node: NodeRef<K, V, C, P, S>, revisions: usize) -> Option<NodeRef<K, V, C, P, S>> {
+        todo!(
+            "ring.push_back(node); pop_front if len > revisions; live.retain(|(_, h, w)| w.strong_count() > 0 && !ptr_eq(w, node) && h + revisions > head.height())"
+        )
     }
 }

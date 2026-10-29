@@ -1,69 +1,87 @@
-//! FIFO: evict in order of first insertion (design §6.1). Updates do not
-//! change position, so `likely_victims` is exact unless a victim is
-//! re-inserted after eviction.
+//! FIFO: evict in order of first insertion (design §6.1). A write to a key
+//! already in the set does not move it, so a hint never retracts a mark and
+//! never excludes a key from the prediction: a hinted in-set key is still
+//! the next victim.
 
-use crate::policy::{EvictionPolicy, HeightDigest};
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::policy::{Eviction, EvictionPolicy, Marks, Prediction, order_digest};
 use crate::types::{Digest, Key};
 
 #[derive(Clone)]
 pub struct Fifo<K: Key> {
-    /// (insertion height, key) in eviction order.
-    order: im::OrdSet<(u64, K)>,
-    /// Reverse index: key -> insertion height.
-    index: im::OrdMap<K, u64>,
-    digest: HeightDigest,
+    /// Consensus state: (insertion height, key) in eviction order; copied
+    /// with the snapshot (design §4). What `state_digest` covers.
+    order: BTreeSet<(u64, K)>,
+    /// Consensus state, derived: key -> insertion height, so a write and a
+    /// removal find the key's place in `order`.
+    index: BTreeMap<K, u64>,
+    /// Eviction target (design §6.2), this policy's own parameter: enters
+    /// `params_digest`. Another policy may have none.
+    low_watermark: usize,
+    /// Prediction state (design §9.2), local: never read by the victim
+    /// selection or by `state_digest`.
+    marks: Marks<K>,
 }
 
 impl<K: Key> Fifo<K> {
-    pub fn new() -> Self {
-        todo!("design §6.1 fifo")
+    pub fn new(low_watermark: usize) -> Self {
+        Self {
+            order: BTreeSet::new(),
+            index: BTreeMap::new(),
+            low_watermark,
+            marks: Marks::default(),
+        }
     }
 
-    /// Shared removal path for `select_victims` and `on_remove`.
-    fn remove(&mut self, key: &K) {
-        todo!("index.remove -> order.remove((h, key)) -> digest.remove")
-    }
-}
-
-impl<K: Key> Default for Fifo<K> {
-    fn default() -> Self {
-        Self::new()
+    /// The v0 rule (design §6.2): nothing while `len <= capacity`, down to
+    /// the watermark once over it. Shared by `writes` and `hint_writes`.
+    fn eviction_count(&self, len: usize, capacity: usize) -> usize {
+        if len > capacity {
+            len.saturating_sub(self.low_watermark)
+        } else {
+            0
+        }
     }
 }
 
 impl<K: Key> EvictionPolicy<K> for Fifo<K> {
-    fn on_write(&mut self, key: &K, height: u64) {
-        todo!("insert only if absent; digest.add")
+    /// Design §6.1: every key absent from `index` is inserted at `(height,
+    /// key)` (a present key keeps its place); `n =
+    /// eviction_count(index.len(), capacity)`; the
+    /// first `n` of `order` are the victims, removed from `order` and
+    /// `index`, returned in that order; `refinement =
+    /// marks.reconcile(&victims, keys)`, which also clears the marks.
+    fn writes(&mut self, keys: &[K], height: u64, capacity: usize) -> Eviction<K> {
+        todo!("design §6.1 fifo writes")
     }
 
-    fn on_remove(&mut self, key: &K) {
-        self.remove(key)
+    /// Design §9.2: `new` = the keys of this hint absent from `index`
+    /// (counted once each); `expected = index.len() + new`; `n =
+    /// eviction_count(expected, capacity)`; `E = n
+    /// > 0 ? n + margin : 0`; walk `order` from the front over the first `E`
+    /// keys and return those not yet marked, marking them. Nothing is
+    /// retracted (a rewrite keeps the key's place). Reads nothing but
+    /// `order`, `index` and the marks; changes the marks only.
+    fn hint_writes(&mut self, keys: &[K], capacity: usize, margin: usize) -> Prediction<K> {
+        todo!("design §9.2 fifo hint_writes")
     }
 
-    fn select_victims(&mut self, n: usize) -> Vec<K> {
-        todo!("first n of `order`, removing each")
+    fn reset_hints(&mut self) {
+        self.marks.clear();
     }
 
-    fn likely_victims(&self, n: usize) -> Vec<K> {
-        todo!("first n of `order`, non-mutating")
-    }
-
-    /// FIFO ignores the exclusion (design §6.1 table): an update does not
-    /// move a key, so a hinted in-set key is still the next victim; excluding
-    /// it would predict keys that stay and cause reverts.
-    fn likely_victims_excluding(&self, n: usize, _exclude: &std::collections::BTreeSet<K>) -> Vec<K> {
-        self.likely_victims(n)
-    }
-
-    fn digest(&self) -> Digest {
-        self.digest.digest()
+    fn state_digest(&self) -> Digest {
+        order_digest(self.name(), self.order.iter())
     }
 
     fn name(&self) -> &'static str {
         "fifo"
     }
 
+    /// SHA-256 of `"auth_wal/policy-params" || low_watermark (u64 LE)`
+    /// (design §6.1, §7.3).
     fn params_digest(&self) -> Digest {
-        [0u8; 32]
+        todo!("sha256(domain || low_watermark LE)")
     }
 }

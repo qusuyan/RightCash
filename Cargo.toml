@@ -13,18 +13,30 @@ description = "Authenticated, bounded, in-memory set of recent writes between EV
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["lthash"]
-lthash = []
-merkle = []
-kzg = []
-ffi = ["lthash"]
+ffi = []
+# Firewood storage backend (design §10), the engine of record; path dependency on ../firewood.
+firewood = ["dep:firewood", "dep:firewood-storage"]
+# Ethereum node hashing for the firewood backend (what the Avalanche adapter uses).
+ethhash = ["firewood?/ethhash"]
 
 [dependencies]
 im = "15"
 sha2 = "0.10"
 blake3 = "1"
+chacha20 = "0.10"
 parking_lot = "0.12"
 thiserror = "2"
+log = "0.4"
+firewood = { path = "../firewood/firewood", optional = true }
+firewood-storage = { path = "../firewood/storage", optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
+rayon = "1"
+
+[[bench]]
+name = "lattice"
+harness = false
 
 [profile.release]
 # Must stay "unwind": the C ABI converts panics into errors (see qmdb-ffi docs/01).

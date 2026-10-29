@@ -1,13 +1,14 @@
-//! `create` workload (design §11). Inserts rows from an empty set, `batch_size` per commit. Every batch overflows the set, so this measures pure eviction throughput.
+//! `create` workload (design §11): inserts `number_of_batches` batches of
+//! `batch_size` rows from an empty database, keys and values `sha256(row)`.
+//! Every batch overflows a write set, so it measures pure eviction throughput;
+//! on a bare engine it is firewood's own `create`.
 
 use std::error::Error;
 
-use auth_wal::policy::EvictionPolicy;
-use auth_wal::storage::MemoryStorage;
-use auth_wal::vc::VectorCommitment;
-
 use crate::report::Measurements;
-use crate::{Args, BenchDb, BenchKey, BenchValue, TestRunner};
+use crate::target::Target;
+use crate::workload::{Recorder, apply, inserts};
+use crate::{Args, TestRunner};
 
 #[derive(Clone, Default)]
 pub struct Create;
@@ -15,19 +16,13 @@ pub struct Create;
 impl TestRunner for Create {
     const NAME: &'static str = "create";
 
-    fn run<C, P>(&self, db: &BenchDb<C, P>, args: &Args) -> Result<Measurements, Box<dyn Error>>
-    where
-        C: VectorCommitment<BenchKey, BenchValue>,
-        P: EvictionPolicy<BenchKey>,
-    {
-        todo!("design §11 create")
-    }
-
-    fn run_baseline(
-        &self,
-        db: &MemoryStorage<BenchKey, BenchValue>,
-        args: &Args,
-    ) -> Result<Measurements, Box<dyn Error>> {
-        todo!("design §11 create baseline")
+    fn run(&self, target: &mut dyn Target, args: &Args) -> Result<Measurements, Box<dyn Error>> {
+        let g = &args.global_opts;
+        let mut rec = Recorder::new(Self::NAME, args);
+        for batch in 0..g.number_of_batches {
+            let ops = inserts(batch * g.batch_size, g.batch_size).collect();
+            apply(target, args, &mut rec, ops)?;
+        }
+        Ok(rec.finish(target.stats()))
     }
 }

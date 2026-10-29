@@ -2,33 +2,61 @@
 
 use std::borrow::Borrow;
 use std::hash::Hash as StdHash;
+use std::sync::Arc;
 
 /// Bound for key types. The set treats keys as opaque and orders them by
-/// `Ord` (canonical iteration, prefix scans, eviction tie-breaks); `Ord` must
-/// agree with the lexicographic order of `as_ref()` bytes, which holds for
-/// every blanket impl below. `Borrow<[u8]>` lets the ordered map position a
-/// range scan at a byte prefix (`PersistentMap::keys_with_prefix`). Only the
-/// commitment scheme needs the bytes. Blanket-implemented for the byte
-/// containers the FFI layer and the benchmarks use (design §4, "Generic key
-/// and value types").
-pub trait Key: Clone + Eq + Ord + StdHash + AsRef<[u8]> + Borrow<[u8]> + Send + Sync + 'static {}
+/// `Ord` (canonical iteration, eviction tie-breaks); `Ord` must agree with
+/// the lexicographic order of `as_ref()` bytes, which holds for every
+/// blanket impl below. `Borrow<[u8]>` lets the memory model's ordered map
+/// position its prefix-delete range scan (`MemoryStorage`; the set itself
+/// has no range scan, R22); it makes `get(&K)` on the std maps ambiguous, so
+/// lookups by `&K` name the key type (`map.get::<K>(key)`). Only the
+/// commitment scheme needs the bytes. Both
+/// keys and values should be **cheap to clone**: every proposal copies the
+/// whole set (design §4, R20), so the FFI layer uses `Arc<[u8]>` for both
+/// (one reference count per clone) and fixed-size arrays are inline.
+/// Blanket-implemented for the byte containers the FFI layer and the
+/// benchmarks use (design §4, "Generic key and value types").
+pub trait Key: Clone + Eq + Ord + AsRef<[u8]> + Borrow<[u8]> + Send + Sync + 'static {}
 
-/// Bound for value types; see [`Key`].
-pub trait Value: Clone + Eq + AsRef<[u8]> + Send + Sync + 'static {}
+/// Bound for value types; see [`Key`]. `from_bytes` lets a storage adapter
+/// rebuild a value from the engine's bytes; for a fixed-size array a length
+/// mismatch is corrupted data and panics.
+pub trait Value: Clone + Eq + AsRef<[u8]> + Send + Sync + 'static {
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
 
+impl Key for Arc<[u8]> {}
 impl Key for Box<[u8]> {}
 impl Key for Vec<u8> {}
 impl<const N: usize> Key for [u8; N] {}
 
-impl Value for Box<[u8]> {}
-impl Value for Vec<u8> {}
-impl<const N: usize> Value for [u8; N] {}
+impl Value for Arc<[u8]> {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bytes.into()
+    }
+}
+impl Value for Box<[u8]> {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bytes.into()
+    }
+}
+impl Value for Vec<u8> {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bytes.to_vec()
+    }
+}
+impl<const N: usize> Value for [u8; N] {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bytes.try_into().expect("stored value has the fixed length of its type")
+    }
+}
 
 /// Length of a root in bytes.
 pub const ROOT_LENGTH: usize = 32;
 
-/// A 32-byte digest that is *not* a root: a set commitment, a policy digest,
-/// a metadata hash (design §7.3).
+/// A 32-byte digest that is *not* a root: a set commitment, a parameter
+/// digest, a metadata hash (design §7.3).
 pub type Digest = [u8; ROOT_LENGTH];
 
 /// An opaque 32-byte combined root (design §7.3). Never comparable with
@@ -55,9 +83,13 @@ pub enum BatchOp<K, V> {
     Delete {
         key: K,
     },
-    /// Applied to matching set entries (range scan) and forwarded to storage
-    /// in the same proposal; fails if the backend rejects it (QMDB does). The
-    /// prefix is raw bytes, not a `K`: a prefix is shorter than a key.
+    /// Part of the `ffi` vocabulary. The engines apply it (firewood, the
+    /// memory model); the write set does not: `propose` rejects a batch that
+    /// contains one (`PrefixDeleteUnsupported`), as QMDB does behind
+    /// qmdb-ffi, because a bounded set cannot apply a prefix delete to the
+    /// keys it does not hold and the adapter never issues one (it bumps
+    /// storage generations instead; design §4, R22). The prefix is raw
+    /// bytes, not a `K`.
     PrefixDelete {
         prefix: Box<[u8]>,
     },
@@ -73,8 +105,23 @@ pub enum Error {
     RevisionStale,
     #[error("proposal has been committed or dropped")]
     ProposalConsumed,
+    /// `Commit` of a node whose parent was dropped before it was committed
+    /// (design §8); also an engine's own answer when a storage proposal is
+    /// attempted on a committed handle whose root the engine has moved past
+    /// (design §10 item 4), surfaced through `propose`.
     #[error("proposal's chain does not start at the committed state")]
     ProposalOrphaned,
+    /// `Commit` of a proposal whose parent is not the head: a deeper
+    /// pipelined node (commit the parent first, as the adapter always does),
+    /// a node on a line that lost, or a child of a retained revision that is
+    /// no longer the head (both never committable); firewood's
+    /// `NotLatest` (design §8; qmdb-ffi's cascade commit is not offered,
+    /// R20).
+    #[error("proposal's parent is not the committed state; commit it first")]
+    ParentUncommitted,
+    /// `Propose` of a batch containing `PrefixDelete` (design §4, R22).
+    #[error("PrefixDelete is not supported by the write set (as by QMDB); the adapter never issues one")]
+    PrefixDeleteUnsupported,
     #[error("database is closed")]
     Closed,
     /// v0 opens only over an engine with nothing committed (design §1, §12.6).
@@ -85,12 +132,16 @@ pub enum Error {
     /// `Propose`/`Commit` refuse from then on: halt rather than diverge.
     #[error("instance poisoned by a failed mid-chain commit: {0}")]
     Poisoned(String),
-    /// `close` was asked to wait for live handles and the deadline passed
-    /// (mirrors qmdb-ffi's `ErrActiveKeepAliveHandles`, design §3).
-    #[error("live proposal or revision handles outstanding")]
+    /// The storage engine refused to close because a live (uncommitted, not
+    /// failed) storage proposal is still held (design §10 item 6): a Rust
+    /// caller still holds a handle to an uncommitted proposal that owns a
+    /// storage proposal. The keep-alive wait itself is Go-side
+    /// (`ErrActiveKeepAliveHandles`, design §3).
+    #[error("live storage proposal handles outstanding")]
     ActiveHandles,
-    #[error("operation not supported by this configuration: {0}")]
-    Unsupported(&'static str),
+    /// `New` could not spawn the instance's worker thread (design §9.2, R17).
+    #[error("speculation worker unavailable: {0}")]
+    WorkerUnavailable(String),
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
     #[error("storage engine error: {0}")]
