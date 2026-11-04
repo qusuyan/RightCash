@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "firewood-style workloads (create, tenkrandom, zipf, single) against auth_wal and bare storage engines (design §11)"
 
-[[bin]]
-name = "auth_wal-benchmark"
-path = "src/main.rs"
-
 [features]
 default = ["firewood"]
 # Vanilla firewood as a target (design §11 baseline, R13).

@@ -36,22 +36,23 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 ///    `commit`, or a `head` handle) returns `ProposalConsumed`. A failed
 ///    `commit` consumes exactly the handle whose own engine commit failed (on
 ///    `NotLatest`, the oldest uncommitted ancestor): that handle reports the
-///    failure, as `Error::Storage`, on every later operation, a retried
+///    failure, as `Error::Storage`, on later reads/proposals/commits, a retried
 ///    `commit` included (design §9.2), and no longer pins the engine; a
 ///    child's later `commit` reports the ancestor's failure, but the child
 ///    itself is not consumed and stays live, readable and pinning, until
 ///    dropped.
-/// 2. After `commit`, `get`/`root` keep working as a view of the committed
-///    root (re-based to the backend's own revision lookup internally) and
-///    return `RevisionStale` once the engine's window has moved past it.
+/// 2. After `commit`, `get` keeps reading the committed view and returns
+///    `RevisionStale` if that view becomes unavailable in the backend.
+///    `root` always returns the cached root and cannot report staleness.
 ///    Implicitly committed ancestors may error, never return wrong data.
 /// 3. Committing a child whose parent handle was already committed succeeds:
 ///    the check is "the chain's base, after committing its uncommitted
 ///    ancestors, is the committed state", not "this proposal's base is".
+///    Compare revision identity, never just roots: a same-root commit is
+///    still a different revision, including on state-function engines.
 /// 4. `propose` on a **committed** handle proposes on the engine's committed
-///    state, provided the engine's committed root equals this handle's root
-///    both before and after the call (an engine whose root is not a state
-///    function compares revision identity instead), and returns
+///    state, provided the handle's revision is the engine's current revision
+///    by identity both before and after the call, and returns
 ///    `ProposalOrphaned` otherwise; it never panics. auth_wal's writer
 ///    proposes on committed handles for the plain proposal of a child whose
 ///    parent's pinned view is committed (a child of the head, or of a live
@@ -83,9 +84,14 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 ///    proposal and proposable per item 4: `head()?.propose(..)` is the one
 ///    way to propose on the committed state.
 pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
+    /// Return this handle's cached storage root. This is not auth_wal's
+    /// combined root and does not check whether the handle is still readable.
     fn root(&self) -> Hash;
 
-    /// `RevisionStale` once the engine has dropped this root from its window.
+    /// Return an owned value for borrowed `key`, or `None` if absent in this
+    /// view. Propagate adapter errors, including a failed handle or a committed
+    /// view that is no longer available (`RevisionStale`). Does not read the
+    /// engine's newer head in place of this view.
     fn get(&self, key: &K) -> Result<Option<V>>;
 
     /// Read-through warming of the trie paths of `keys` through this handle:
@@ -105,21 +111,32 @@ pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Child proposal on top of this one (chaining; design §9), or, on a
-    /// committed handle, on the committed state (item 4).
+    /// Return a new uncommitted child with borrowed `batch` applied in order.
+    /// The result must own everything it needs after the inputs are dropped.
+    /// `metadata` is optional engine metadata; the built-in adapters ignore it
+    /// (auth_wal hashes it separately into its combined root).
+    ///
+    /// A live handle chains from its own state. A committed handle may propose
+    /// only while it is the engine's current revision by identity, otherwise
+    /// return `ProposalOrphaned`. Do not change committed state; dropping the
+    /// result must leave no committed trace. Other adapter errors propagate.
     fn propose(&self, batch: &[BatchOp<K, V>], metadata: Option<&[u8]>) -> Result<Self>;
 
-    /// Commits this proposal and any uncommitted ancestors, oldest first.
-    /// Once-only; see the contract above.
+    /// Commit this proposal and its uncommitted storage ancestors oldest first;
+    /// return this proposal's storage root. The handle remains readable after
+    /// success, but committing it again returns `ProposalConsumed`.
+    /// An error may follow successful ancestor commits; this is not an atomic
+    /// chain transaction. See the failed-handle rules above for retries.
     fn commit(&self) -> Result<Hash>;
 }
 
 pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
     type Proposal: StorageProposal<K, V> + 'static;
 
-    /// Stable identifier hashed into the root preimage (design §7.3): every
-    /// engine reports `EMPTY_ROOT` before its first commit, so without it two
-    /// networks on different engines would share roots.
+    /// Stable identifier hashed into the root preimage (design §7.3), including
+    /// the engine's consensus parameters (Firewood's hashing algorithm).
+    /// Every engine reports `EMPTY_ROOT` before its first commit, so without
+    /// it incompatible engines could share roots until the first eviction.
     const ENGINE_ID: &'static str;
 
     /// Whether the root is a function of the stored state alone (firewood,
@@ -130,7 +147,7 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
 
     /// Whether each proposal of a committed chain becomes its own revision
     /// (firewood, `MemoryStorage`) rather than folding into one record
-    /// (QMDB). Sizes the engine window: `K * (1 + rounds)` when speculating
+    /// (QMDB). Sizes the engine window: `K * rounds` when speculating
     /// (design §8).
     const COMMITS_CHAIN_LINKS_SEPARATELY: bool;
 

@@ -3,27 +3,11 @@
 //! behind its feature in a temporary directory.
 
 use super::*;
+use crate::tests::{del, k, put};
 use crate::types::{BatchOp, EMPTY_ROOT, Error};
 
 type K = Vec<u8>;
 type V = Vec<u8>;
-
-fn put(k: &str, v: &str) -> BatchOp<K, V> {
-    BatchOp::Put {
-        key: k.as_bytes().to_vec(),
-        value: v.as_bytes().to_vec(),
-    }
-}
-
-fn del(k: &str) -> BatchOp<K, V> {
-    BatchOp::Delete {
-        key: k.as_bytes().to_vec(),
-    }
-}
-
-fn k(s: &str) -> K {
-    s.as_bytes().to_vec()
-}
 
 /// Reads the committed state through the engine's `head()` handle (contract
 /// item 7): the only read path auth_wal uses.
@@ -145,15 +129,15 @@ fn state_function<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
 
     let spec = make();
     spec.head().unwrap().propose(&base, None).unwrap().commit().unwrap();
-    // Link predicts k1 (right), k3 (wrong, absent before) and k9 (wrong, present before).
-    let link = spec
+    // The step predicts k1 (right), k3 (wrong, absent before) and k9 (wrong, present before).
+    let step = spec
         .head()
         .unwrap()
         .propose(&[put("k1", "v1"), put("k3", "v3"), put("k9", "changed")], None)
         .unwrap();
     // F: reverts first (k3 -> absent, k9 -> old value), then the batch
-    // omitting the pair identical in the link (k1).
-    let f = link
+    // omitting the pair identical in the step (k1).
+    let f = step
         .propose(&[del("k3"), put("k9", "v9"), put("k2", "v2")], None)
         .unwrap();
     let spec_root = f.commit().unwrap();
@@ -334,9 +318,156 @@ fn head_handle<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
     assert!(matches!(c1.commit(), Err(Error::ProposalConsumed)));
 }
 
+/// Empty values: stored, read back as `Some([])` through every handle kind,
+/// distinct from absence in the root, deletable.
+fn empty_values<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
+    let s = make();
+    let p = s.head().unwrap().propose(&[put("e", ""), put("f", "1")], None).unwrap();
+    assert_eq!(p.get(&k("e")).unwrap(), Some(Vec::new()), "live proposal");
+    let r = p.commit().unwrap();
+    assert_eq!(p.get(&k("e")).unwrap(), Some(Vec::new()), "committed handle");
+    assert_eq!(get(&s, "e"), Some(Vec::new()), "head");
+    let other = make();
+    let r2 = other
+        .head()
+        .unwrap()
+        .propose(&[put("f", "1")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_ne!(r, r2, "an empty value and an absent key differ in the root");
+    s.head()
+        .unwrap()
+        .propose(&[put("f", "")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(get(&s, "f"), Some(Vec::new()), "an empty value over a value");
+    s.head().unwrap().propose(&[del("e")], None).unwrap().commit().unwrap();
+    assert_eq!(get(&s, "e"), None);
+}
+
+/// Contract item 2, second half: an implicitly committed ancestor may error
+/// but never answers wrong data, and is consumed; deletes of absent keys
+/// through a chain read back as absent.
+fn implicitly_committed_ancestor<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
+    let s = make();
+    let a = s.head().unwrap().propose(&[put("a", "1")], None).unwrap();
+    let b = a.propose(&[put("b", "2")], None).unwrap();
+    let rb = b.commit().unwrap();
+    assert_eq!(s.root(), rb);
+    if let Ok(v) = a.get(&k("b")) {
+        assert_eq!(v, None, "the ancestor's view must not show the child's write");
+    }
+    if let Ok(v) = a.get(&k("a")) {
+        assert_eq!(v, Some(k("1")));
+    }
+    assert!(matches!(a.commit(), Err(Error::ProposalConsumed)));
+    assert!(matches!(
+        a.propose(&[put("c", "3")], None),
+        Err(Error::ProposalOrphaned)
+    ));
+    let c = s.head().unwrap().propose(&[del("nope")], None).unwrap();
+    let d = c.propose(&[del("nope"), put("x", "1")], None).unwrap();
+    d.commit().unwrap();
+    assert_eq!(d.get(&k("nope")).unwrap(), None);
+    assert_eq!(get(&s, "nope"), None);
+    assert_eq!(get(&s, "x"), Some(k("1")));
+}
+
+/// A chain whose base was followed by a *same-root* commit (a no-op batch)
+/// is refused (contract items 3 and 4 compare revisions by identity, not
+/// by root): the oldest link fails and is consumed, its child stays live,
+/// the superseded committed handle no longer proposes, and a fresh `head`
+/// does. The Firewood adapter preserves this logical revision rule even
+/// when the backend absorbs a same-root commit without creating a revision.
+fn commit_after_same_root_commit<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
+    let s = make();
+    s.head()
+        .unwrap()
+        .propose(&[put("a", "1")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    let r1 = s.root();
+    let base = s.head().unwrap();
+    let step = base.propose(&[put("b", "2")], None).unwrap();
+    let child = step.propose(&[put("c", "3")], None).unwrap();
+    let r2 = s
+        .head()
+        .unwrap()
+        .propose(&[put("a", "1")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(r1, r2, "a no-op commit keeps the root");
+    assert!(
+        matches!(child.commit(), Err(Error::Storage(_))),
+        "the chain's base was superseded"
+    );
+    assert!(
+        matches!(step.commit(), Err(Error::Storage(_))),
+        "the oldest link is consumed"
+    );
+    assert_eq!(child.get(&k("c")).unwrap(), Some(k("3")), "the child stays live");
+    assert!(matches!(
+        base.propose(&[put("d", "4")], None),
+        Err(Error::ProposalOrphaned)
+    ));
+    s.head()
+        .unwrap()
+        .propose(&[put("e", "5")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(get(&s, "b"), None);
+    assert_eq!(get(&s, "e"), Some(k("5")));
+}
+
+/// A live proposal built on a committed handle keeps reading its base
+/// exactly, however many commits follow and whether or not the base left
+/// the engine's window: a proposal names its base by hash and reads nodes
+/// by address, so the adapter pins the base through the handle (design
+/// §10 (c)). `make` opens the engine with a window of two revisions and,
+/// on firewood, no node cache, so the reads go to the file.
+fn live_proposal_on_a_reaped_base<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
+    let s = make();
+    let n = 200usize;
+    let key = |i: usize| format!("key-{i:04}");
+    let base: Vec<BatchOp<K, V>> = (0..n).map(|i| put(&key(i), &format!("base-{i:04}"))).collect();
+    s.head().unwrap().propose(&base, None).unwrap().commit().unwrap();
+    let head = s.head().unwrap();
+    let live = head.propose(&[put("zz", "1")], None).unwrap();
+    drop(head);
+    for round in 0..20 {
+        let batch: Vec<BatchOp<K, V>> = (0..n)
+            .map(|i| put(&key(i), &format!("round-{round:02}-{i:04}")))
+            .collect();
+        s.head().unwrap().propose(&batch, None).unwrap().commit().unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for i in 0..n {
+        assert_eq!(
+            live.get(&k(&key(i))).unwrap(),
+            Some(k(&format!("base-{i:04}"))),
+            "key {i}"
+        );
+    }
+    assert_eq!(live.get(&k("zz")).unwrap(), Some(k("1")));
+}
+
 #[test]
 fn memory_contract() {
     contract(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
+    empty_values(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
+    implicitly_committed_ancestor(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
+    commit_after_same_root_commit(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
+    live_proposal_on_a_reaped_base(|| {
+        MemoryStorage::<K, V>::new(MemoryConfig {
+            revisions: 2,
+            ..MemoryConfig::default()
+        })
+    });
     state_function(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
     close_requires_no_live_handles(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
     failed_commit_consumes_the_handle(|| MemoryStorage::<K, V>::new(MemoryConfig::default()));
@@ -405,28 +536,29 @@ fn memory_revision_window_goes_stale() {
 
 #[cfg(feature = "firewood")]
 mod firewood_backend {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::num::NonZeroUsize;
 
     use super::*;
     use crate::storage::firewood::{FirewoodConfig, FirewoodStorage};
-
-    static N: AtomicUsize = AtomicUsize::new(0);
+    use crate::tests::TempDir;
 
     thread_local! {
-        /// Databases this test thread created, removed by `cleanup`.
-        static DIRS: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// Databases this test thread created, removed by `Cleanup`.
+        static DIRS: std::cell::RefCell<Vec<TempDir>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    fn temp_db() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "auth_wal-fw-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        DIRS.with(|d| d.borrow_mut().push(dir.clone()));
-        dir
+    fn make_with(revisions: usize, node_cache_bytes: usize) -> FirewoodStorage {
+        let dir = TempDir::new("fw");
+        let mut cfg = FirewoodConfig::new(dir.db());
+        cfg.truncate = true;
+        cfg.revisions = revisions;
+        cfg.node_cache_bytes = NonZeroUsize::new(node_cache_bytes).expect("non-zero");
+        DIRS.with(|d| d.borrow_mut().push(dir));
+        FirewoodStorage::new(cfg).expect("firewood opens")
+    }
+
+    fn make() -> FirewoodStorage {
+        make_with(8, 192_000_000)
     }
 
     /// Removes this thread's databases when dropped, on success and on panic.
@@ -435,25 +567,18 @@ mod firewood_backend {
 
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            DIRS.with(|d| {
-                for dir in d.borrow_mut().drain(..) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            });
+            DIRS.with(|d| d.borrow_mut().clear());
         }
-    }
-
-    fn make() -> FirewoodStorage {
-        let mut cfg = FirewoodConfig::new(temp_db().join("db"));
-        cfg.truncate = true;
-        cfg.revisions = 8;
-        FirewoodStorage::new(cfg).expect("firewood opens")
     }
 
     #[test]
     fn firewood_contract() {
         let _cleanup = Cleanup;
         contract(make);
+        empty_values(make);
+        implicitly_committed_ancestor(make);
+        commit_after_same_root_commit(make);
+        live_proposal_on_a_reaped_base(|| make_with(2, 1));
         state_function(make);
         close_requires_no_live_handles(make);
         failed_commit_consumes_the_handle(make);

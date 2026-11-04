@@ -7,17 +7,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Authenticated, bounded, in-memory set of recent writes between EVM validators and an authenticated storage engine"
 
-[lib]
-# rlib for Rust consumers (benchmark, tests); staticlib for the C ABI / Go `ffi`
-# package, exactly as qmdb-ffi is linked.
-crate-type = ["rlib", "staticlib"]
-
 [features]
-ffi = []
 # Firewood storage backend (design §10), the engine of record; path dependency on ../firewood.
 firewood = ["dep:firewood", "dep:firewood-storage"]
 # Ethereum node hashing for the firewood backend (what the Avalanche adapter uses).
-ethhash = ["firewood?/ethhash"]
+# Select Ethereum mode when opening Firewood; upstream supports both modes.
+ethhash = []
 
 [dependencies]
 im = "15"
@@ -30,14 +25,8 @@ log = "0.4"
 firewood = { path = "../firewood/firewood", optional = true }
 firewood-storage = { path = "../firewood/storage", optional = true }
 
-[dev-dependencies]
-criterion = "0.8"
-rayon = "1"
-
-[[bench]]
-name = "lattice"
-harness = false
-
 [profile.release]
-# Must stay "unwind": the C ABI converts panics into errors (see qmdb-ffi docs/01).
+# Must stay "unwind" (the default): the worker catches a step's panic
+# (`speculate.rs`, `worker_panics`), and the C ABI of milestone 4 converts
+# panics into errors, as qmdb-ffi's does.
 panic = "unwind"

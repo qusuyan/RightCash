@@ -7,11 +7,12 @@
 //!
 //! A `Node` is the immutable record of one proposal (design §8, R20): its
 //! snapshot (the whole set after its batch), its pinned storage view, the
-//! number of speculative steps under it, its root with the metadata hash
-//! that entered it, and one weak link to its parent. Nothing in it is written
-//! after construction, so the writer, the worker and the reader threads
-//! share it freely and every read is one lookup with no lock (design §5,
-//! §10). Committed-ness is registry membership: the `Registry` is the K-ring
+//! number of speculative steps under it, its root, and one weak link to its
+//! parent. Its fields are fixed after construction; the snapshot's local
+//! prediction marks and the storage handle's commit state have their own
+//! synchronization. Reads check the snapshot, then storage on a miss; they
+//! never walk parent nodes. Storage adapters may acquire locks (design §5,
+//! §10). Committed status is registry membership: the `Registry` is the K-ring
 //! of committed nodes in commit order (its newest entry is the head) and the
 //! live index, nothing else, behind the one mutex (`Shared.registry`); every
 //! hold is a few pointer operations or a scan of the ring (design §10). A
@@ -21,9 +22,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use crate::policy::EvictionPolicy;
-use crate::set::Snapshot;
-use crate::storage::StorageEngine;
-use crate::types::{Digest, Hash, Key, Result, Value};
+use crate::set::{Entry, Snapshot};
+use crate::storage::{StorageEngine, StorageProposal};
+use crate::types::{Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
 pub(crate) type NodeRef<K, V, C, P, S> = Arc<Node<K, V, C, P, S>>;
@@ -48,7 +49,7 @@ pub(crate) struct Node<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -66,16 +67,14 @@ where
     /// the same `Arc`. `Commit` tells the two apart by identity with the
     /// head's view (design §8).
     storage_view: StorageView<K, V, S>,
-    /// Speculative steps the node's own storage proposal chains on (`F` on
+    /// Speculative ancestors the node's storage view chains on (the final view on
     /// `S1..Sk`, design §9.1); 0 for a plain proposal or an inherited view.
     /// A failed engine commit poisons the instance iff this is non-zero
     /// (design §9.2).
     steps: u32,
-    /// `SHA-256(metadata)` or zeros (design §7.3): the one preimage term not
-    /// derivable from the node and the writer's `root::Terms`, kept so a
-    /// proof (design §7.4) can rebuild the preimage.
-    metadata_hash: Digest,
-    /// `root::Terms::combine` over the node's terms, computed by `propose`.
+    /// `root::Terms::combine` over the node's terms, computed by `propose`
+    /// (the metadata hash among them is not kept: a proof, design §7.4,
+    /// will take it from the caller, milestone 5).
     root: Hash,
 }
 
@@ -83,32 +82,31 @@ impl<K, V, C, P, S> Node<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    /// A live node (design §8 Propose); `root` is `Terms::combine` of the
-    /// writer's terms and this node's own, computed by `propose`.
+    /// Return an `Arc` owning a node with the supplied state. `snapshot` is its
+    /// complete write set; `parent` is a weak link to the proposal parent (empty
+    /// for initialization); `storage_view` is the storage state read on a set
+    /// miss. `steps` counts speculative ancestors of this node's own storage
+    /// proposal, or is zero for a plain proposal or an inherited view.
+    /// `root` must already combine these states using the writer's root terms.
+    /// This constructor stores the inputs; it does not validate or register them.
     pub(crate) fn new(
         snapshot: Snapshot<K, V, C, P>,
         parent: WeakNode<K, V, C, P, S>,
         storage_view: StorageView<K, V, S>,
         steps: u32,
-        metadata_hash: Digest,
         root: Hash,
     ) -> NodeRef<K, V, C, P, S> {
-        todo!("design §8 Propose")
-    }
-
-    /// The genesis node (design §8, §7.3): the empty set at height 0, no
-    /// parent (a dead weak link), the engine's `head()` as its view (design
-    /// §10 item 7), no storage proposal, no steps, zero metadata hash, root
-    /// `EMPTY_ROOT` (what `combine` gives any height-0 preimage).
-    pub(crate) fn genesis(
-        snapshot: Snapshot<K, V, C, P>,
-        storage_view: StorageView<K, V, S>,
-    ) -> NodeRef<K, V, C, P, S> {
-        todo!("design §8 genesis; debug_assert!(snapshot.height() == 0 && snapshot.len() == 0)")
+        Arc::new(Self {
+            snapshot,
+            parent,
+            storage_view,
+            steps,
+            root,
+        })
     }
 
     pub(crate) fn root(&self) -> Hash {
@@ -124,11 +122,25 @@ where
         &self.snapshot
     }
 
-    /// Design §5: the snapshot (`Value` is the value, `Tombstone` is absent
-    /// and stops), then the pinned storage view, which returns
-    /// `RevisionStale` once the engine dropped its root. No lock.
+    /// Return the owned value for borrowed `key`, or `None` if absent/deleted.
+    /// A snapshot tombstone suppresses any older storage value. Only a key
+    /// absent from the snapshot is read through the pinned storage view, whose
+    /// errors (including `RevisionStale`) propagate. The snapshot lookup takes
+    /// no lock; the storage adapter may lock. No parent node is consulted.
     pub(crate) fn get(&self, key: &K) -> Result<Option<V>> {
-        todo!("design §5")
+        match self.snapshot.get(key) {
+            Some(Entry::Value(value)) => Ok(Some(value)),
+            // Falling through here would resurrect a value deleted by this snapshot.
+            Some(Entry::Tombstone) => Ok(None),
+            None => self.storage_view.get(key),
+        }
+    }
+
+    /// The parent, if still alive (one `Weak` upgrade, no lock): `Commit`'s
+    /// check (design §8). The temporary is the caller's to release after
+    /// its registry hold.
+    pub(crate) fn parent(&self) -> Option<NodeRef<K, V, C, P, S>> {
+        self.parent.upgrade()
     }
 
     /// Whether `node` is this node's parent (pointer identity on the weak
@@ -161,7 +173,7 @@ pub struct Handle<K, V, C, P, S>(NodeRef<K, V, C, P, S>)
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>;
 
@@ -169,7 +181,7 @@ impl<K, V, C, P, S> Handle<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -181,13 +193,19 @@ where
         &self.0
     }
 
+    /// `Commit` takes the handle by value (design §8): the node it held.
+    pub(crate) fn into_node(self) -> NodeRef<K, V, C, P, S> {
+        self.0
+    }
+
     /// The single combined commitment (design §7.3), known before commit.
     pub fn root(&self) -> Hash {
         self.0.root
     }
 
-    /// Design §5: one lookup in the node's snapshot, then its pinned storage
-    /// view. No lock.
+    /// Return the owned value for `key` at this handle's node, or `None` if
+    /// absent/deleted. Consult storage only on a snapshot miss, propagating
+    /// storage errors. Does not lock the registry; the storage adapter may lock.
     pub fn get(&self, key: &K) -> Result<Option<V>> {
         self.0.get(key)
     }
@@ -197,14 +215,14 @@ where
 /// index, nothing else (the statistics are atomics on `Shared`). The one
 /// structure the writer changes and readers read, behind `Shared.registry`
 /// (design §10: every hold is a few pointer operations or a scan of the
-/// ring, never an engine call, a snapshot copy or a drop; retired entries
+/// ring, never an engine call, a snapshot copy or final node destruction; retired entries
 /// are handed back to be dropped after the hold). The committed set is the
 /// head's snapshot.
 pub(crate) struct Registry<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -237,18 +255,25 @@ impl<K, V, C, P, S> Registry<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    /// Genesis (design §8, §7.3): `genesis` is `Node::genesis`, root
-    /// `EMPTY_ROOT`; it enters the ring, so `revision(EMPTY_ROOT)` resolves
-    /// on a fresh instance (design §3) until it leaves the K-ring. Both lists
-    /// are pre-sized (the ring to `revisions + 1`, the live index to a few
-    /// entries) so neither an install nor a register allocates; `revisions`
-    /// itself is not kept (`advance` takes it).
+    /// Return a registry whose only committed node is `genesis` and whose live
+    /// index is empty. `genesis` may contain an initialized nonempty snapshot;
+    /// the caller has already computed its root. `revisions` is the maximum
+    /// retained committed-node count, validated by the caller.
+    ///
+    /// Reserve `revisions + 1` ring slots so `advance` can push before retiring
+    /// an entry. Reserve 16 live-index slots initially; that vector can grow.
+    /// The window size is not stored and must also be passed to `advance`.
     pub fn new(genesis: NodeRef<K, V, C, P, S>, revisions: usize) -> Self {
-        todo!("ring: VecDeque::with_capacity(revisions + 1) holding genesis; live: Vec::with_capacity(16)")
+        let mut ring = VecDeque::with_capacity(revisions + 1);
+        ring.push_back(genesis);
+        Self {
+            ring,
+            live: Vec::with_capacity(16),
+        }
     }
 
     /// The newest committed node (design §8): the committed set is its
@@ -262,32 +287,47 @@ where
     /// newest first), then the first live node still alive under `root`. No
     /// mutation.
     pub fn lookup(&self, root: Hash) -> Option<NodeRef<K, V, C, P, S>> {
-        todo!("ring.iter().rev().find(root), else upgrade the live triples with that root in order")
+        if let Some(node) = self.ring.iter().rev().find(|node| node.root() == root) {
+            return Some(node.clone());
+        }
+        self.live
+            .iter()
+            .filter(|(r, _, _)| *r == root)
+            .find_map(|(_, _, weak)| weak.upgrade())
     }
 
-    /// Adds a live node to the index (design §8 Propose, second hold; once
-    /// per node, `propose` is the only caller) after dropping the dead
-    /// links, so the list stays bounded by the live proposals.
+    /// Register borrowed `node` for lookup by root, after removing dead weak
+    /// links. Stores only its root, height, and a weak reference; the caller
+    /// must keep the node alive. Returns `()` and may grow the index. Call once
+    /// per new node: duplicate registrations are not checked.
     pub fn register(&mut self, node: &NodeRef<K, V, C, P, S>) {
-        todo!("retain strong_count > 0; push (root, height, downgrade)")
+        self.live.retain(|(_, _, weak)| weak.strong_count() > 0);
+        self.live.push((node.root(), node.height(), Arc::downgrade(node)));
     }
 
-    /// Makes `node` the head (design §8 Commit): it is pushed on the ring and
-    /// leaves the live index by identity, along with any dead link and any
-    /// entry `revisions` or more heights below the new head (one window for
-    /// both lists, R22, `h + revisions > head.height()` on the cached height,
-    /// no upgrade: such a node, if still held, stays readable but no longer
-    /// resolves by root; the ring answers for the committed root, so
-    /// `lookup` there finds the committed node, not a live sibling sharing
-    /// the root); with the ring
-    /// over `revisions` entries the oldest is popped and **returned for the
-    /// caller to drop after releasing the lock** (its snapshot and engine
-    /// view go with it unless a handle still holds it; the precomputation
-    /// holds its target weakly, design §8).
+    /// Install owned `node` as the newest committed head. `revisions` is the
+    /// retained-node limit, validated by the caller and unchanged since `new`.
+    /// The caller must have checked parent eligibility and committed storage.
+    ///
+    /// Remove this node's live-index entry by pointer identity, plus dead links
+    /// and entries at heights outside the new window. Append the node to the
+    /// committed ring. If the ring exceeds the limit, return its oldest node;
+    /// otherwise return `None`. Drop that returned node after releasing the
+    /// registry lock so destruction does not block other registry users.
+    /// Existing handles still own nodes removed from the registry, but lookup
+    /// by root no longer finds them unless another retained/live entry matches.
     #[must_use = "drop the retired node after releasing the registry lock"]
     pub fn advance(&mut self, node: NodeRef<K, V, C, P, S>, revisions: usize) -> Option<NodeRef<K, V, C, P, S>> {
-        todo!(
-            "ring.push_back(node); pop_front if len > revisions; live.retain(|(_, h, w)| w.strong_count() > 0 && !ptr_eq(w, node) && h + revisions > head.height())"
-        )
+        let head_height = node.height();
+        let window = revisions as u64;
+        self.live.retain(|(_, height, weak)| {
+            weak.strong_count() > 0 && !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&node)) && height + window > head_height
+        });
+        self.ring.push_back(node);
+        if self.ring.len() > revisions {
+            self.ring.pop_front()
+        } else {
+            None
+        }
     }
 }

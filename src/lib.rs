@@ -13,8 +13,8 @@
 //! | [`lattice`]   | §7.2, §10 | lattice-hash accumulator shared by `lthash` and `MemoryStorage` |
 //! | [`storage`]   | §10    | `StorageEngine` abstraction and the in-memory model of firewood |
 //! | [`proposal`]  | §8     | immutable nodes, the handle, the registry |
-//! | [`speculate`] | §9     | the worker: a channel of requests, the thread that builds steps, `submit`/`finish`/`reset` |
-//! | `ffi`         | §2     | C ABI consumed by the Go `ffi` package (feature `ffi`) |
+//! | [`speculate`] | §9     | the worker: a channel of requests, the thread that builds steps, `submit`/`finish`/`block_end`/`reset` |
+//! | [`timings`]   | §9.5, §11 | per-call phase timings of `propose` and `commit`, read by the benchmark's `--breakdown` |
 //!
 //! Threading (design §3, R19): [`AuthWal`] is the **writer**; every operation
 //! that changes state takes `&mut self`, so the type system serialises them.
@@ -23,10 +23,6 @@
 //! snapshot's policy behind its own; the worker is reached over a channel
 //! (design §10 lists every hold).
 
-// Skeleton phase: bodies are `todo!()`, so parameters are unused for now.
-// Remove once milestone 1 lands.
-#![allow(unused_variables, dead_code)]
-
 pub mod lattice;
 pub mod policy;
 pub mod proposal;
@@ -34,22 +30,26 @@ pub mod root;
 pub mod set;
 pub mod speculate;
 pub mod storage;
+pub mod timings;
 pub mod types;
 pub mod vc;
 
-#[cfg(feature = "ffi")]
-pub mod ffi;
+#[cfg(test)]
+mod tests;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use crate::policy::EvictionPolicy;
-use crate::proposal::{Handle, NodeRef, Registry, WeakNode};
-use crate::speculate::{Counters, SpeculationStats, Worker};
-use crate::storage::StorageEngine;
-use crate::types::{BatchOp, Hash, Key, Result, Value};
+use crate::policy::{EvictionPolicy, Prediction};
+use crate::proposal::{Handle, Node, NodeRef, Registry, StorageView, WeakNode};
+use crate::set::{Entries, Snapshot};
+use crate::speculate::{Counters, SpecOp, SpeculationStats, Worker, entries_to_ops};
+use crate::storage::{StorageEngine, StorageProposal};
+use crate::timings::{CommitTimings, ProposeTimings};
+use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
 /// Consensus parameters: they enter the root preimage (design §7.3) and must
@@ -71,40 +71,40 @@ pub struct Local {
     /// Speculative eviction (design §9): send predicted victims to the engine
     /// early. Requires `S::ROOT_IS_STATE_FUNCTION`.
     pub speculate: bool,
-    /// Maximum steps per precomputation (design §9.2), the one `finish`
-    /// builds included; sizes the engine window (`engine_window`).
+    /// Maximum storage proposals on one chain (design §9.2), including
+    /// the final refinement, however many blocks the chain spans (R35); sizes the
+    /// engine window (`engine_window`).
     pub speculation_rounds: u32,
-    /// Minimum queued ops before the worker builds a step ahead of `finish`
+    /// Minimum distinct queued keys before the worker builds a step ahead of `finish`
     /// (design §9.2).
     pub speculation_min_step: usize,
     /// Extra predicted victims beyond the strict count once a hint's
-    /// insertions carry the set over capacity (design §9.2, R15: pessimistic
+    /// insertions reach the high watermark (design §9.2, R15: pessimistic
     /// prediction); handed to the policy's `hint_writes`.
     pub speculation_margin: usize,
 }
 
 impl Default for Local {
     fn default() -> Self {
-        // Rounds and min_step are provisional until the milestone-3 sweep (design §9.2).
+        // Rounds remain provisional; min_step follows the focused Zipf comparison (design §9.2, §14).
         Self {
             revisions: 128,
             speculate: false,
             speculation_rounds: 3,
-            speculation_min_step: 1_000,
+            speculation_min_step: 256,
             speculation_margin: 0,
         }
     }
 }
 
 impl Local {
-    /// The engine window these settings need (design §8): `revisions * (1 +
-    /// rounds)` when speculating on an engine that commits chained proposals
-    /// separately (`S::COMMITS_CHAIN_LINKS_SEPARATELY`), else `revisions`.
+    /// The engine window these settings need (design §8): `revisions * rounds`
+    /// when speculating on an engine that commits chained proposals separately (`S::COMMITS_CHAIN_LINKS_SEPARATELY`), else `revisions`.
     /// One formula for `AuthWal::new`'s check, the benchmark's engine config
-    /// and the Go `New`.
+    /// and the adapter's `New` (milestone 4).
     pub fn engine_window(&self, commits_chain_links_separately: bool) -> usize {
         if self.speculate && commits_chain_links_separately {
-            self.revisions * (1 + self.speculation_rounds as usize)
+            self.revisions * self.speculation_rounds as usize
         } else {
             self.revisions
         }
@@ -122,13 +122,27 @@ pub struct Config {
 }
 
 impl Config {
-    /// `capacity >= 1`, `revisions >= 2`
-    /// (the adapter resolves the parent's root right after a commit, design
-    /// §8), and when speculating `speculation_rounds >= 1` and
-    /// `speculation_min_step >= 1` (0 would permit empty steps). Called first
-    /// thing by `AuthWal::new`.
+    /// Return `Ok(())` if capacity is at least 1 and revisions at least 2,
+    /// plus positive rounds and min-step when speculation is enabled.
+    /// Otherwise return `InvalidConfig`. Does not mutate configuration or
+    /// validate the supplied snapshot, policy, or storage engine; `new` does
+    /// those checks separately.
     pub fn validate(&self) -> Result<()> {
-        todo!()
+        if self.consensus.capacity == 0 {
+            return Err(Error::InvalidConfig("capacity must be at least 1".into()));
+        }
+        if self.local.revisions < 2 {
+            return Err(Error::InvalidConfig("revisions must be at least 2 (design §8)".into()));
+        }
+        if self.local.speculate {
+            if self.local.speculation_rounds == 0 {
+                return Err(Error::InvalidConfig("speculation_rounds must be at least 1".into()));
+            }
+            if self.local.speculation_min_step == 0 {
+                return Err(Error::InvalidConfig("speculation_min_step must be at least 1".into()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -141,13 +155,14 @@ pub struct Stats {
     pub height: u64,
     pub occupancy: usize,
     pub total_evictions: u64,
-    /// Ops in the nodes' own storage proposals,
-    /// `total_evictions.saturating_sub(reused_ops) + reverted_ops` (step ops
-    /// are not counted; saturating because the two counter sets are bumped
-    /// at different moments, so a concurrent read may briefly see `reused`
-    /// ahead); derived in `stats()`.
+    /// Logical reconciliation ops: evictions not already predicted, plus
+    /// withdrawals. Excludes queued hint ops merged into finalization;
+    /// `last_propose_timings().storage_ops` measures the actual final batch.
+    /// Derived as `total_evictions.saturating_sub(reused_ops) + reverted_ops`;
+    /// saturation handles counters sampled between independent updates.
     pub total_storage_ops: u64,
-    /// `plain + speculative`, derived in `stats()`.
+    /// Evicting proposal outcomes, `plain + speculative`. Includes reuse
+    /// of an exact worker view; worker `steps_built` counts materializations.
     pub storage_proposals: u64,
     /// All `Put` ops applied.
     pub puts: u64,
@@ -155,6 +170,24 @@ pub struct Stats {
     /// `zipf` benchmark's hit rate is `in_place_updates / puts`).
     pub in_place_updates: u64,
     pub speculation: SpeculationStats,
+}
+
+impl Stats {
+    /// The counters' growth since `base` (saturating: the counters are
+    /// bumped at different moments); `height` and `occupancy` are this
+    /// reading's. The benchmark's warm-up subtraction (design §11).
+    pub fn since(&self, base: &Stats) -> Stats {
+        Stats {
+            height: self.height,
+            occupancy: self.occupancy,
+            total_evictions: self.total_evictions.saturating_sub(base.total_evictions),
+            total_storage_ops: self.total_storage_ops.saturating_sub(base.total_storage_ops),
+            storage_proposals: self.storage_proposals.saturating_sub(base.storage_proposals),
+            puts: self.puts.saturating_sub(base.puts),
+            in_place_updates: self.in_place_updates.saturating_sub(base.in_place_updates),
+            speculation: self.speculation.since(&base.speculation),
+        }
+    }
 }
 
 /// Lock-free accumulators behind the set half of [`Stats`] (design §9.5):
@@ -167,26 +200,23 @@ pub(crate) struct SetCounters {
 }
 
 /// State shared between the writer, the readers and the worker thread
-/// (design §8, §10): the counters (set and speculation) and the closing
-/// flag, atomics; the registry behind one mutex. No configuration (the writer owns it),
-/// no engine (the writer owns it, R19), no handle count and no closed flag
-/// for reads (R20: the Go layer counts its outstanding handles; the engine
-/// refuses to close while a live storage proposal is held). Handles hold
-/// only their node.
+/// (design §8, §10): the counters (set and speculation), atomics; the
+/// registry behind one mutex. No configuration (the writer owns it), no
+/// engine (the writer owns it, R19), no handle count and no closed flag
+/// (the writer keeps its own; reads never check one, R20: the Go layer
+/// counts its outstanding handles; the engine refuses to close while a live
+/// storage proposal is held). Handles hold only their node.
 pub(crate) struct Shared<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
     pub(crate) set: SetCounters,
-    pub(crate) counters: Counters,
-    /// Set by `close`: the writer's operations report `Closed` from then on
-    /// and hints are no-ops (reads never check it, R20). The worker needs no
-    /// flag: dropping its channel's sender ends it (design §9.2).
-    pub(crate) closing: AtomicBool,
+    /// Shared with the worker thread by `Arc`: all it needs of this state.
+    pub(crate) counters: Arc<Counters>,
     /// The registry (design §8), one of the locks (design §10): held for a
     /// few pointer operations or a scan of at most K roots by the writer
     /// (resolve the parent, register, check at commit, install, resolve at
@@ -197,13 +227,14 @@ where
 
 /// The read side of an instance (design §3 threading contract): `Clone +
 /// Send + Sync`, for the RPC and mempool threads. Each call takes the
-/// registry lock once, for nanoseconds, to resolve the head or a root; the
-/// read itself takes no lock (design §10). The writer holds one too.
+/// registry lock briefly to resolve the head or a root, then releases it
+/// before reading values. Storage adapters may take their own locks.
+/// The writer holds one too.
 pub struct Reader<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -214,7 +245,7 @@ impl<K, V, C, P, S> Clone for Reader<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -229,20 +260,24 @@ impl<K, V, C, P, S> Reader<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    /// Reads `key` from the committed state (design §5): one registry hold
-    /// clones the head (one `Arc`), then `head.get(key)` with no lock.
+    /// Return the owned value for `key`, or `None` if absent/deleted, from the
+    /// head selected at the start of this call. Clone that node under the
+    /// registry lock, then release the lock before reading. Storage errors
+    /// propagate; a concurrent commit does not change the selected snapshot.
     pub fn get(&self, key: &K) -> Result<Option<V>> {
-        todo!("let head = registry.lock().head().clone(); head.get(key)")
+        let head = self.shared.registry.lock().head().clone();
+        head.get(key)
     }
 
-    /// The single combined commitment of the committed state; `EMPTY_ROOT`
-    /// until the first commit (design §7.3). One registry hold.
+    /// Return the committed head's combined root under one registry hold.
+    /// Initially `EMPTY_ROOT` for an empty height-zero set, or the supplied
+    /// snapshot's combined root when initialized with existing entries.
     pub fn root(&self) -> Hash {
-        todo!("registry.lock().head().root()")
+        self.shared.registry.lock().head().root()
     }
 
     /// Read-only handle at `root`: one of the last K commits or a live
@@ -250,12 +285,17 @@ where
     /// (`Registry::lookup`: the ring, then live proposals). `RevisionNotFound`
     /// otherwise.
     pub fn revision(&self, root: Hash) -> Result<Handle<K, V, C, P, S>> {
-        todo!("registry.lock().lookup(root).map(Handle::new).ok_or(RevisionNotFound)")
+        self.shared
+            .registry
+            .lock()
+            .lookup(root)
+            .map(Handle::new)
+            .ok_or(Error::RevisionNotFound)
     }
 
     /// A handle to the committed state, one registry hold.
     pub fn latest_revision(&self) -> Handle<K, V, C, P, S> {
-        todo!("Handle::new(registry.lock().head().clone())")
+        Handle::new(self.shared.registry.lock().head().clone())
     }
 
     /// One registry hold reads the head's height and occupancy; every
@@ -263,7 +303,24 @@ where
     /// `counters.snapshot()`); `storage_proposals` and `total_storage_ops`
     /// are derived from them (design §9.5).
     pub fn stats(&self) -> Stats {
-        todo!("hold: height/occupancy from head(); then relaxed loads of set and counters.snapshot()")
+        let (height, occupancy) = {
+            let registry = self.shared.registry.lock();
+            let head = registry.head();
+            (head.height(), head.snapshot().len())
+        };
+        let set = &self.shared.set;
+        let total_evictions = set.total_evictions.load(Ordering::Relaxed);
+        let speculation = self.shared.counters.snapshot();
+        Stats {
+            height,
+            occupancy,
+            total_evictions,
+            total_storage_ops: total_evictions.saturating_sub(speculation.reused_ops) + speculation.reverted_ops,
+            storage_proposals: speculation.plain + speculation.speculative,
+            puts: set.puts.load(Ordering::Relaxed),
+            in_place_updates: set.in_place_updates.load(Ordering::Relaxed),
+            speculation,
+        }
     }
 }
 
@@ -282,7 +339,7 @@ pub struct AuthWal<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
@@ -293,9 +350,9 @@ where
     // then the engine (handles keep what they need alive).
     reader: Reader<K, V, C, P, S>,
     /// The writer's interface to the worker (design §9.2, R17): `submit`,
-    /// `finish`, `reset`; spawned by `new` after the shared state exists,
-    /// stopped and joined by `close`.
-    worker: Worker<K, V, C, P, S>,
+    /// `finish`, `block_end`, `reset`; spawned by `new` only with speculation
+    /// enabled, stopped and joined by `close`. The plain path has no worker.
+    worker: Option<Worker<K, V, S>>,
     /// The node the precomputation is for (design §9.2 "Target"): the node
     /// the next block builds on, whose snapshot's policy carries the marks.
     /// Weak: the caller's handle owns the node; dead means no target.
@@ -312,37 +369,112 @@ where
     /// Set by a failed mid-chain engine commit (design §9.2); `propose` and
     /// `commit` return `Error::Poisoned` from then on.
     poisoned: Option<String>,
+    /// Set by `close`: the writer's operations report `Closed` from then on
+    /// and hints are no-ops; reads never check it (R20). The worker needs
+    /// no flag: dropping its channel's sender ends it (design §9.2).
+    closed: bool,
+    /// Where the last `propose` and the last successful `commit` spent their
+    /// time (design §9.5): read by `last_propose_timings` and
+    /// `last_commit_timings`.
+    last_propose: ProposeTimings,
+    last_commit: CommitTimings,
 }
 
 impl<K, V, C, P, S> AuthWal<K, V, C, P, S>
 where
     K: Key,
     V: Value,
-    C: VectorCommitment<K, V>,
+    C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    /// Opens an empty write set in front of `storage` (design §3 New).
-    /// Runs `config.validate()` first, requires a fresh engine
-    /// (`storage.root() == EMPTY_ROOT`, else `EngineNotFresh`; design §1,
-    /// §12.6), rejects `speculate` unless `S::ROOT_IS_STATE_FUNCTION`
-    /// (design §9.3, `InvalidConfig`), and checks the engine's window:
-    /// `storage.revisions() >=
-    /// local.engine_window(S::COMMITS_CHAIN_LINKS_SEPARATELY)` (design §8;
-    /// the Go `New` and the benchmark open the engine with that size). The
-    /// policy's eviction rule is checked where it acts, not here:
-    /// `Snapshot::apply` asserts the set is within capacity after `writes`
-    /// (design §6.2). Then computes the root terms (`root::Terms` from
-    /// `vc.scheme_id()` and `params_digest()`, `policy.name()` and
-    /// `params_digest()` and `S::ENGINE_ID`, design §7.3), builds the genesis
-    /// node (`Node::genesis` over `Snapshot::genesis(vc, policy, capacity)`,
-    /// whose policy digest is the empty order's, and `Arc::new(
-    /// storage.head()?)`, design §10 item 7), the registry and the shared
-    /// state (`Arc::new`), and spawns the worker
-    /// with a clone of it (`Worker::spawn(shared, min_step, rounds)`,
-    /// `WorkerUnavailable` on failure). The target starts dead.
-    pub fn new(config: Config, storage: S, policy: P, vc: C) -> Result<Self> {
-        todo!("design §3 New")
+    /// Opens the supplied set in front of fresh `storage` (design §3 New).
+    /// The set owns its entries, policy, commitment scheme and capacity;
+    /// its capacity must match `config.consensus.capacity`. A populated set
+    /// starts at its own height and authenticated root; an empty height-zero
+    /// set retains `EMPTY_ROOT`. This is initialization, not database recovery.
+    /// Validates configuration, set policy, engine freshness and revision
+    /// window. The target starts dead, with no speculative proposals.
+    pub fn new(config: Config, storage: S, snapshot: Snapshot<K, V, C, P>) -> Result<Self> {
+        config.validate()?;
+        snapshot.validate(config.consensus.capacity)?;
+        if config.local.speculate && !S::ROOT_IS_STATE_FUNCTION {
+            return Err(Error::InvalidConfig(
+                "speculative eviction requires an engine whose root is a function of state (design §9.3)".into(),
+            ));
+        }
+        if storage.root() != EMPTY_ROOT {
+            return Err(Error::EngineNotFresh);
+        }
+        let window = config.local.engine_window(S::COMMITS_CHAIN_LINKS_SEPARATELY);
+        if storage.revisions() < window {
+            return Err(Error::InvalidConfig(format!(
+                "the engine keeps {} revisions, these settings need {window} (design §8)",
+                storage.revisions()
+            )));
+        }
+        let terms = snapshot.terms(S::ENGINE_ID);
+        // A supplied set has no engine precomputation associated with it.
+        snapshot.reset_hints();
+        let head = Arc::new(storage.head()?);
+        let initial_root = terms.combine(
+            snapshot.capacity(),
+            snapshot.height(),
+            snapshot.commitment(),
+            snapshot.policy_digest(),
+            head.root(),
+            root::metadata_hash(None),
+        );
+        let genesis = Node::new(snapshot, Weak::new(), head.clone(), 0, initial_root);
+        // The worker starts on this node's view, so its first submissions need
+        // no reset. Plain instances have no speculation target.
+        let target = if config.local.speculate {
+            Arc::downgrade(&genesis)
+        } else {
+            Weak::new()
+        };
+        let shared = Arc::new(Shared {
+            set: SetCounters::default(),
+            counters: Arc::new(Counters::default()),
+            registry: Mutex::new(Registry::new(genesis, config.local.revisions)),
+        });
+        let worker = if config.local.speculate {
+            Some(
+                Worker::spawn(
+                    head,
+                    shared.counters.clone(),
+                    config.local.speculation_min_step,
+                    config.local.speculation_rounds,
+                )
+                .map_err(|e| Error::WorkerUnavailable(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            reader: Reader { shared },
+            worker,
+            target,
+            storage,
+            config,
+            terms,
+            poisoned: None,
+            closed: false,
+            last_propose: ProposeTimings::default(),
+            last_commit: CommitTimings::default(),
+        })
+    }
+
+    /// Return timings from the last successful `propose`, for the benchmark's
+    /// `--breakdown`. All zero before the first success; failed calls leave the
+    /// previous reading unchanged.
+    pub fn last_propose_timings(&self) -> ProposeTimings {
+        self.last_propose
+    }
+
+    /// Where the last successful `commit` spent its time (design §9.5).
+    pub fn last_commit_timings(&self) -> CommitTimings {
+        self.last_commit
     }
 
     /// The read side (design §3 threading contract): a `Clone + Send + Sync`
@@ -351,135 +483,313 @@ where
         self.reader.clone()
     }
 
-    /// Proposes `batch` on `parent`, the committed state when `None` (design
-    /// §3 `Propose`/`Proposal.Propose`, §8 Propose). `metadata` is
-    /// root-affecting (design §7.3). `Closed` (the shared closing flag),
-    /// `Poisoned` and `PrefixDeleteUnsupported` (a batch containing one,
-    /// design §4, R22) checks first. Under the registry lock (first hold):
-    /// `head = registry.head().clone()`; the parent node is `head` for `None`
-    /// and for a `Some(n)` whose root is the head's (equal set, policy and
-    /// storage state, design §7.3: the head node's snapshot and pinned view
-    /// are used, so a child never chains on a twin's uncommitted engine
-    /// proposal), else `n` itself whatever its lineage, as firewood and
-    /// qmdb-ffi accept (design §8: a child of a node that can no longer be
-    /// committed is itself never committable and `Commit` says so; if its
-    /// batch evicts, the engine may refuse the storage proposal with
-    /// `ProposalOrphaned`, design §10 item 4, which this returns). Then with
-    /// no lock held: `applied = parent.snapshot().apply(batch)` (the copy,
-    /// design §4: the policy clone carries the parent's marks, which `writes`
-    /// reconciles into `applied.refinement`; the worker keeps hashing
-    /// meanwhile); then, if `self.targets(parent)`, `finished =
-    /// self.worker.finish()` (design §9.2, R24: blocks until every submitted
-    /// op reached the engine; `Some((latest, steps))` when at least one
-    /// step was built).
-    /// The storage view (design §9.1): on `Some((latest, steps))`, read the
-    /// old value of every key of `refinement.retract` through the parent's
-    /// pinned view (`Put(old)`, `Delete` if absent; the read-back is kept by
-    /// decision pending a firewood restore op, design §12.10 (e)), append
-    /// `entries_to_ops` of the entries of `evicted` whose key is in
-    /// `refinement.evict` (both in key order: one merge), and `F =
-    /// latest.propose(ops, metadata)` (built even with no op: the node's
-    /// view must be the reconciled one); a failed read or a failed `F`:
-    /// count `fallbacks` and take the plain path (always available, design
-    /// §10 item 5). Otherwise (`None`: not the target, no step built, a step
-    /// failed, the worker gone; `finish` is not called off the target), with
-    /// nothing evicted inherit the parent's
-    /// view, else the plain path, `parent.storage_view().propose(
-    /// entries_to_ops(evicted), metadata)` (the handle's own dispatch,
-    /// design §10 item 4; the refinement is ignored). `steps` is `finish`'s
-    /// when `F` was built and 0 otherwise, the fallback included.
-    /// Count the proposal with no lock held (`counters`, design §9.5:
-    /// `plain` for a plain proposal, a fallback included; `speculative` with
-    /// `steps`, `reused_ops = evicted.len() - refinement.evict.len()` and
-    /// `reverted_ops = refinement.retract.len()` for `F`). `metadata_hash =
-    /// root::metadata_hash(metadata)`, `root = self.terms.combine(
-    /// snapshot.capacity(), snapshot.height(), snapshot.commitment(),
-    /// snapshot.policy_digest(), view.root(), metadata_hash)`,
-    /// `Node::new(snapshot, Arc::downgrade(parent), view, steps,
-    /// metadata_hash, root)`, and add the batch counts to `set` (puts,
-    /// in-place updates, evictions; relaxed atomics, no lock). Under the
-    /// registry lock (second hold): `registry.register(&node)`; return
-    /// `Handle::new(node)`. A second child of the same target reuses the
-    /// same steps: the parent's marks are still there and `finish` answers
-    /// the same latest view (design §9.2).
+    /// `Closed` once `close` began, `Poisoned` after a failed mid-chain
+    /// commit (design §8, §9.2): the first checks of `propose` and `commit`.
+    fn check_open(&self) -> Result<()> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if let Some(reason) = &self.poisoned {
+            return Err(Error::Poisoned(reason.clone()));
+        }
+        Ok(())
+    }
+
+    /// Return `(node, head)` for a borrowed optional `view`. `None` selects the
+    /// committed head. A handle with the same combined root as the head also
+    /// selects the actual head node; any other handle selects its own node.
+    /// Both returned values are owning `Arc` clones. Locks the registry only
+    /// while resolving them, and does not check whether `node` can be committed.
+    fn resolve(&self, view: Option<&Handle<K, V, C, P, S>>) -> Resolved<K, V, C, P, S> {
+        let registry = self.reader.shared.registry.lock();
+        let head = registry.head().clone();
+        let node = match view {
+            None => head.clone(),
+            Some(handle) if handle.root() == head.root() => head.clone(),
+            Some(handle) => handle.node().clone(),
+        };
+        (node, head)
+    }
+
+    /// Build and register an uncommitted child; return its readable handle and
+    /// make its combined root available immediately through `Handle::root`.
+    ///
+    /// - `parent`: borrowed handle to build on; `None` selects the committed head.
+    ///   A handle whose root equals the head's is resolved to the actual head.
+    /// - `batch`: owned puts/deletes in execution order. Repeated keys are allowed;
+    ///   the last operation wins. Prefix deletes are rejected before application.
+    /// - `metadata`: optional bytes hashed into the combined root, and forwarded to
+    ///   storage if a storage proposal is built. The node does not retain the bytes.
+    ///
+    /// Builds a fresh snapshot, sends evicted entries to a new storage proposal
+    /// (or reuses speculative work), and registers the node for root lookup.
+    /// When nothing is evicted, the child inherits the parent's storage view.
+    /// Updates proposal counters and `last_propose` on success; speculative worker
+    /// work and counters may already have changed if a later storage call fails.
+    /// Does not commit storage or advance the committed head.
+    ///
+    /// Returns `Closed`, `Poisoned`, `PrefixDeleteUnsupported`, or a storage error.
+    /// A successful proposal does not guarantee commit eligibility: `commit` still
+    /// requires its parent to be the current head.
     pub fn propose(
         &mut self,
         parent: Option<&Handle<K, V, C, P, S>>,
         batch: Vec<BatchOp<K, V>>,
         metadata: Option<&[u8]>,
     ) -> Result<Handle<K, V, C, P, S>> {
-        todo!("design §8 Propose")
+        let started = Instant::now();
+        self.check_open()?;
+        if batch.iter().any(|op| matches!(op, BatchOp::PrefixDelete { .. })) {
+            return Err(Error::PrefixDeleteUnsupported);
+        }
+        let batch_ops = batch.len();
+        let (parent, _head) = self.resolve(parent);
+        let set::Applied {
+            snapshot,
+            evicted,
+            refinement,
+            summary,
+            mut timings,
+        } = parent.snapshot().apply(batch);
+        let evictions = evicted.len();
+        timings.batch_ops = batch_ops;
+        timings.evicted = evictions;
+        let counters = self.reader.shared.counters.clone();
+
+        // Keep predictions provisional until actual eviction. On the target,
+        // the worker finalizes evictions; other branches and failures use the
+        // plain proposal on the parent's storage view.
+        let speculative = self.targets(&parent);
+        let keep_chain = speculative && evictions == 0;
+        let (view, steps) = if keep_chain {
+            // The worker's early writes are still provisional. Keep them off
+            // this node's pinned view until a later block actually evicts keys.
+            // R35 (design §9.1): the chain is kept and this node becomes its
+            // target once built (below). What the block owes the chain goes
+            // down as ops, then the block end (no reply) so the worker
+            // builds what is pending.
+            let worker = self.worker.as_ref().expect("a targeted node has a worker");
+            worker.block_end(spec_ops(&snapshot, refinement.evict, refinement.retract));
+            counters.chains_kept.fetch_add(1, Ordering::Relaxed);
+            (parent.storage_view().clone(), 0)
+        } else if speculative && let Some(found) = self.finish_speculation(&evicted, refinement, metadata, &mut timings)
+        {
+            found
+        } else {
+            // The plain path (design §9.2): nothing marked is in this node's
+            // storage, whatever the parent's marks said.
+            snapshot.reset_hints();
+            if evicted.is_empty() {
+                (parent.storage_view().clone(), 0)
+            } else {
+                counters.plain.fetch_add(1, Ordering::Relaxed);
+                let ops = entries_to_ops(evicted);
+                let mark = Instant::now();
+                let proposal = parent.storage_view().propose(&ops, metadata)?;
+                timings.storage = mark.elapsed();
+                timings.storage_ops = ops.len();
+                (Arc::new(proposal), 0)
+            }
+        };
+
+        let mark = Instant::now();
+        let root = self.terms.combine(
+            snapshot.capacity(),
+            snapshot.height(),
+            snapshot.commitment(),
+            snapshot.policy_digest(),
+            view.root(),
+            root::metadata_hash(metadata),
+        );
+        let node = Node::new(snapshot, Arc::downgrade(&parent), view, steps, root);
+        if keep_chain {
+            self.target = Arc::downgrade(&node);
+        } else if speculative {
+            // Finalization consumed the parent's chain. Start prediction on
+            // this child immediately, including before its parent commits.
+            self.retarget(&node);
+        }
+        let set = &self.reader.shared.set;
+        set.puts.fetch_add(summary.puts as u64, Ordering::Relaxed);
+        set.in_place_updates
+            .fetch_add(summary.in_place_updates as u64, Ordering::Relaxed);
+        set.total_evictions.fetch_add(evictions as u64, Ordering::Relaxed);
+        self.reader.shared.registry.lock().register(&node);
+        timings.rest = mark.elapsed();
+        timings.steps = steps;
+        timings.total = started.elapsed();
+        self.last_propose = timings;
+        Ok(Handle::new(node))
     }
 
-    /// Commits `handle`'s node (design §3 `Proposal.Commit`, §8 Commit);
-    /// consumes the handle **on every outcome**, a pre-check failure included
-    /// (design §8: the node is untouched then, but the proposal is freed
-    /// unless another handle holds it; this mirrors firewood's `commit(self)`
-    /// and the adapter never hits it). `Closed`/`Poisoned` checks first.
-    /// Upgrade the node's parent link with no lock held (the temporary, a
-    /// dropped parent's last reference at worst, is released after the hold,
-    /// design §10), then under the registry lock (one hold), three checks in
-    /// this order:
-    /// `node.root() == head.root()` ->
-    /// `ProposalConsumed` (the head itself or an equal-root twin: that state
-    /// is committed); the parent link dead -> `ProposalOrphaned` (the parent
-    /// was dropped uncommitted, so this node can never be committed); the
-    /// parent not the head node (`Arc::ptr_eq`) -> `ParentUncommitted` (a
-    /// deeper pipelined node, or a line that lost: commit the parent first,
-    /// or never; design §8); in the same hold, `owns = !Arc::ptr_eq(
-    /// node.storage_view(), head.storage_view())` (an inherited view is the
-    /// head's, the same `Arc`). Then with no lock held: if `owns`, commit
-    /// `node.storage_view()` (the engine commits a speculative node's steps
-    /// first, design §10); on an error, set `poisoned` iff `node.steps() > 0`
-    /// (the cascade may have moved the engine head to a state no node owns,
-    /// design §9.2) and return the error (the head stays where it was; no
-    /// retarget). Then under the registry lock (one hold): `retired =
-    /// registry.advance(node.clone(), self.config.local.revisions)`; after
-    /// the hold drop `retired` (a snapshot and engine handles: not a
-    /// nanosecond hold, design §10). Then `self.after_commit(&node)` (design
-    /// §9.2: leave the precomputation alone when it already targets the new
-    /// head or a live child of it, else retarget it to the new head; nothing
-    /// held). Returns `node.root()`, the combined root `Root()` reports from
-    /// now on (design §3).
-    /// `commit` never waits for the worker (R17); its engine commit may wait
-    /// on the handle lock for the one step being hashed on the handle it
-    /// commits, when the next block's hints already queued ops on this node
-    /// (the pipelined flow, design §9.2).
+    /// Consume `handle` on every outcome and, on success, return its combined
+    /// root after installing that node as the new committed head.
+    ///
+    /// Rejects a closed/poisoned writer, a root already equal to the head's
+    /// (`ProposalConsumed`), a dropped parent (`ProposalOrphaned`), or a parent
+    /// that is not the current head node (`ParentUncommitted`). This method does
+    /// not commit parent auth_wal nodes automatically.
+    ///
+    /// If the node owns a different storage view from the head, commit that view
+    /// and its speculative storage ancestors first. On failure, leave the registry
+    /// head unchanged; if speculative steps were involved, poison the writer
+    /// because some storage ancestors may already have committed.
+    ///
+    /// On success, advance the registry, release the retired revision outside its
+    /// lock, update the speculation target, and record `last_commit`. Registry
+    /// locks are never held during storage commit or worker communication.
     pub fn commit(&mut self, handle: Handle<K, V, C, P, S>) -> Result<Hash> {
-        todo!("design §8 Commit, §9.2")
+        let started = Instant::now();
+        let node = handle.into_node();
+        self.check_open()?;
+        let parent = node.parent();
+        let owns = {
+            let registry = self.reader.shared.registry.lock();
+            let head = registry.head();
+            if node.root() == head.root() {
+                return Err(Error::ProposalConsumed);
+            }
+            match &parent {
+                None => return Err(Error::ProposalOrphaned),
+                Some(parent) if !Arc::ptr_eq(parent, head) => return Err(Error::ParentUncommitted),
+                Some(_) => {}
+            }
+            // An inherited view is already committed. Equal root bytes are
+            // insufficient: a new no-op storage proposal still needs commit.
+            !Arc::ptr_eq(node.storage_view(), head.storage_view())
+        };
+        drop(parent);
+        let mut timings = CommitTimings::default();
+        if owns {
+            let mark = Instant::now();
+            if let Err(e) = node.storage_view().commit() {
+                if node.steps() > 0 {
+                    // The storage chain can fail after earlier links commit;
+                    // the unchanged auth_wal head would then lag storage.
+                    self.poisoned = Some(e.to_string());
+                }
+                return Err(e);
+            }
+            timings.engine = mark.elapsed();
+        }
+        let mark = Instant::now();
+        let retired = self
+            .reader
+            .shared
+            .registry
+            .lock()
+            .advance(node.clone(), self.config.local.revisions);
+        // Release potentially large snapshots and storage handles after the
+        // temporary registry guard above has been dropped.
+        drop(retired);
+        timings.advance = mark.elapsed();
+        let mark = Instant::now();
+        self.after_commit(&node);
+        timings.retarget = mark.elapsed();
+        timings.total = started.elapsed();
+        self.last_commit = timings;
+        Ok(node.root())
     }
 
-    /// `propose` on the committed state followed by `commit` (design §3
-    /// `Update`).
+    /// Finalize the target's chain on the worker. The final refinement is
+    /// merged with queued hints before hashing, so no separate caller-side
+    /// proposal is needed. Consumes the chain even on failure: its corrections
+    /// belong to this candidate and cannot be reused by a sibling.
+    fn finish_speculation(
+        &mut self,
+        evicted: &Entries<K, V>,
+        refinement: Prediction<K>,
+        metadata: Option<&[u8]>,
+        timings: &mut ProposeTimings,
+    ) -> Option<(StorageView<K, V, S>, u32)> {
+        self.target = Weak::new();
+        let reused = evicted.len() - refinement.evict.len();
+        let reverted = refinement.retract.len();
+        // Both lists are sorted. Select final values in one pass; values of
+        // actual victims are no longer in the child's retained snapshot.
+        let mut entries = evicted.iter();
+        let mut ops = Vec::with_capacity(refinement.evict.len() + reverted);
+        for key in refinement.evict {
+            let (_, value) = entries
+                .find(|(candidate, _)| candidate == &key)
+                .expect("final refinement must name an actual victim");
+            ops.push(SpecOp::Evict(key, value.clone()));
+        }
+        ops.extend(refinement.retract.into_iter().map(SpecOp::Retract));
+        let mark = Instant::now();
+        let finished = self.worker.as_ref()?.finish(ops, metadata);
+        timings.finish = mark.elapsed();
+        let counters = &self.reader.shared.counters;
+        match finished {
+            Ok(finished) => {
+                timings.speculative = true;
+                timings.reads = finished.timings.reads;
+                timings.storage = finished.timings.storage;
+                timings.storage_ops = finished.timings.ops;
+                // These worker phases ran inside the wait. Keep the public
+                // breakdown additive rather than counting them twice.
+                timings.finish = timings.finish.saturating_sub(timings.reads + timings.storage);
+                counters.speculative.fetch_add(1, Ordering::Relaxed);
+                counters.steps.fetch_add(u64::from(finished.steps), Ordering::Relaxed);
+                counters.reused_ops.fetch_add(reused as u64, Ordering::Relaxed);
+                counters.reverted_ops.fetch_add(reverted as u64, Ordering::Relaxed);
+                Some((finished.view, finished.steps))
+            }
+            Err(error) => {
+                log::debug!("auth_wal: {error}; taking the plain path");
+                counters.fallbacks.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Apply owned `batch` to the committed head and immediately commit it.
+    /// `metadata` has the same meaning as in `propose`. Returns the new combined
+    /// root or the first error from `propose`/`commit`; their side effects and
+    /// failure rules also apply. Does not build on a supplied live proposal.
     pub fn update(&mut self, batch: Vec<BatchOp<K, V>>, metadata: Option<&[u8]>) -> Result<Hash> {
         let handle = self.propose(None, batch, metadata)?;
         self.commit(handle)
     }
 
-    /// Prefetch hint (design §9.4, R14): execution reading through `view`
-    /// (the committed state when `None`) is writing `keys`. Feeds the
-    /// precomputation; the adapter's finalise-time hook lands here with the
-    /// revision at the parent root as `view`. Advisory; a no-op after
-    /// `close` (the closing flag is checked first) and with speculation off.
-    /// Under the registry lock (one hold): resolve `view` as `propose` does
-    /// (the head node for `None` and for a root equal to the head's),
-    /// cloning the node and the head. Then with no lock of auth_wal's held
-    /// but the policy's (design §9.2 "Target"): if the node is a live child
-    /// of the target (`self.target().is_some_and(|t| node.parent_is(&t))`),
-    /// or there is no live target and the node is the head or a live child
-    /// of it (`node.parent_is(&head)`), `self.retarget(&node)`; then, if
-    /// `self.targets(&node)`: `pred = node.snapshot().hint_writes(keys,
-    /// local.speculation_margin)` (the policy lock, design §4, §6.1), `ops`
-    /// = `SpecOp::Evict(k, entry)` for every key of `pred.evict` with its
-    /// entry from the node's snapshot (the policy tracks exactly the set's
-    /// keys; a missing one is a policy bug, `unreachable!`) then
-    /// `SpecOp::Retract(k)` for every key of `pred.retract`, and
-    /// `worker.submit(ops)` if any; count `hint_keys`. A hint on any other
-    /// node does nothing (no warming: the steps are the warming, R26). The
-    /// hint returns at once and never waits for the engine (R17). Hints are
-    /// advisory: engine errors are counted on the worker, never returned.
+    /// Hint that execution based on `view` expects to write borrowed `keys`.
+    /// `None` selects the committed head; other views resolve as in `propose`.
+    /// Duplicate keys and repeated hints are allowed.
+    ///
+    /// Returns `()` without waiting for engine work. With speculation disabled
+    /// or the writer closed, does nothing. Otherwise it may select a new target:
+    /// a child of the current target, or (with no live target) the head or its child.
+    /// Hints for other nodes are ignored.
+    ///
+    /// For the selected target, updates local prediction marks and queues entries
+    /// or retractions for the worker. Does not read storage to warm paths directly,
+    /// change consensus state, or return worker errors. A policy naming an eviction
+    /// candidate absent from the target snapshot causes a panic.
     pub fn prefetch(&mut self, view: Option<&Handle<K, V, C, P, S>>, keys: &[K]) {
-        todo!("design §9.4")
+        if self.closed || self.worker.is_none() {
+            return;
+        }
+        let (node, head) = self.resolve(view);
+        let retarget = match self.target() {
+            Some(target) => node.parent_is(&target),
+            None => Arc::ptr_eq(&node, &head) || node.parent_is(&head),
+        };
+        if retarget {
+            self.retarget(&node);
+        }
+        if !self.targets(&node) {
+            return;
+        }
+        self.reader
+            .shared
+            .counters
+            .hint_keys
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let prediction = node.snapshot().hint_writes(keys, self.config.local.speculation_margin);
+        self.worker
+            .as_ref()
+            .expect("a targeted node has a worker")
+            .submit(spec_ops(node.snapshot(), prediction.evict, prediction.retract));
     }
 
     /// Pass-through to `StorageEngine::prune` (design §3).
@@ -487,26 +797,24 @@ where
         self.storage.prune()
     }
 
-    /// Mirrors qmdb-ffi's `Close` (design §3), a writer operation: the Go
-    /// layer has already waited for its outstanding handles.
-    /// Sets the closing flag first (writer operations report `Closed` from
-    /// now on and hints are no-ops), then `worker.shutdown()` (drops the
-    /// channel's sender and joins the thread, whose step being built
-    /// finishes and whose chain, the only speculative engine handles there
-    /// were, drops with it, design §9.2); then `storage.close()` through the
-    /// writer's exclusive reference, which succeeds because committed
-    /// proposals do not pin the engine (design §10 item 6) and reports
-    /// `ActiveHandles` if a Rust caller still holds a handle to an
-    /// uncommitted proposal with its own storage proposal. Reads through
-    /// handles and `Reader`s keep working afterwards, the retained revisions
-    /// included: the registry is not touched, and the ring is freed with the
-    /// instance (nothing outlives the writer and its readers in any real
-    /// path, R22). The firewood file stays open (and locked) while the
-    /// head's pinned view lives, so an in-process reopen of the same
-    /// directory needs this `AuthWal` dropped first (the Go `Close` drops
-    /// it). Idempotent and allowed on a poisoned instance.
+    /// Stop writer use and request engine closure. Returns `Ok(())` once the
+    /// engine closes, or its error (including `ActiveHandles` while uncommitted
+    /// storage proposals remain alive).
+    ///
+    /// Sets `closed` before stopping and joining the worker, then calls the engine.
+    /// Even if the engine refuses closure, `propose`, `commit`, and `update` remain
+    /// closed and hints remain no-ops; drop outstanding proposals and retry `close`.
+    /// `prune` is a direct engine hook and does not check this flag.
+    ///
+    /// Retained handles and readers can still read available revisions. Committed
+    /// storage handles do not prevent closure. Repeated calls are allowed, including
+    /// on a poisoned writer.
     pub fn close(&mut self) -> Result<()> {
-        todo!("closing.store(true); worker.shutdown(); storage.close()")
+        self.closed = true;
+        if let Some(mut worker) = self.worker.take() {
+            worker.shutdown();
+        }
+        self.storage.close()
     }
 
     /// Whether `node` is the precomputation's target (pointer identity on the
@@ -520,15 +828,20 @@ where
         self.target.upgrade()
     }
 
-    /// Retargets the precomputation to `node` (design §9.2 "Target"):
-    /// `node.snapshot().reset_hints()` (the policy forgets its marks: nothing
-    /// marked is in the new generation's storage), `self.target =
-    /// Arc::downgrade(node)`, `self.worker.reset(node.storage_view()
-    /// .clone())` (a fresh chain on the new base; the thread drops the old
-    /// one and its queued ops, counting unread steps).
-    /// No step is planned: the first hint plans (design §12.5).
+    /// Select borrowed `node` as the speculation target and return `()`.
+    /// With no worker, does nothing. Otherwise stores a weak node reference,
+    /// queues a reset to its storage view, then queues the snapshot values of all
+    /// still-marked keys. It does not wait for the worker or clear the node's marks.
+    ///
+    /// Resending matters because a prediction mark survives across blocks, but its
+    /// old speculative writes are not automatically present on the new base.
+    /// Only `propose`'s no-eviction path keeps an existing chain without a reset.
     fn retarget(&mut self, node: &NodeRef<K, V, C, P, S>) {
-        todo!("design §9.2 retarget")
+        let Some(worker) = &self.worker else { return };
+        self.target = Arc::downgrade(node);
+        worker.reset(node.storage_view().clone());
+        let snapshot = node.snapshot();
+        worker.submit(spec_ops(snapshot, snapshot.predicted(), std::iter::empty()));
     }
 
     /// After the `commit` that just installed `head` (design §9.2). No-op
@@ -539,8 +852,43 @@ where
     /// parent), leave it alone; otherwise `self.retarget(head)`. `commit`'s
     /// caller never waits for engine work here (R17).
     fn after_commit(&mut self, head: &NodeRef<K, V, C, P, S>) {
-        todo!("design §9.2 after a commit")
+        if self.worker.is_none() {
+            return;
+        }
+        if self.targets(head) || self.target().is_some_and(|target| target.parent_is(head)) {
+            return;
+        }
+        self.retarget(head);
     }
+}
+
+/// What `AuthWal::resolve` answers: the node a call is about and the head.
+type Resolved<K, V, C, P, S> = (NodeRef<K, V, C, P, S>, NodeRef<K, V, C, P, S>);
+
+/// Return worker operations from borrowed `snapshot` and two owned-key iterators:
+/// `evict` keys become `SpecOp::Evict` with their current snapshot entries;
+/// `retract` keys become `SpecOp::Retract` without a snapshot lookup.
+/// All evictions precede all retractions, preserving each iterator's order;
+/// there is no sorting or deduplication. Panics if an eviction key is absent.
+/// Does not change the snapshot, marks, or worker.
+fn spec_ops<K, V, C, P>(
+    snapshot: &Snapshot<K, V, C, P>,
+    evict: impl IntoIterator<Item = K>,
+    retract: impl IntoIterator<Item = K>,
+) -> Vec<SpecOp<K, V>>
+where
+    K: Key,
+    V: Value,
+    C: VectorCommitment<K>,
+    P: EvictionPolicy<K>,
+{
+    let evict = evict.into_iter().map(|key| {
+        let Some(entry) = snapshot.get(&key) else {
+            unreachable!("the eviction policy named a key the set lacks (design §6.1 invariant)");
+        };
+        SpecOp::Evict(key, entry)
+    });
+    evict.chain(retract.into_iter().map(SpecOp::Retract)).collect()
 }
 
 #[cfg(test)]

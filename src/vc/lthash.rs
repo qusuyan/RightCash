@@ -3,10 +3,10 @@
 //! §7.2 entry item (`tag || key || value`). Authenticates the set as a whole;
 //! no per-key proofs.
 
-use crate::lattice::{LANES, LatticeAccumulator};
-use crate::set::Entry;
-use crate::types::{Digest, Key, Value};
-use crate::vc::VectorCommitment;
+use crate::lattice::LatticeAccumulator;
+use crate::set::EntryRef;
+use crate::types::{Digest, Key};
+use crate::vc::{VectorCommitment, item_fields};
 
 const TAG: &str = "auth_wal/lthash";
 
@@ -16,7 +16,7 @@ pub struct LtHash;
 
 #[derive(Clone)]
 pub struct LtHashState {
-    acc: LatticeAccumulator<LANES>,
+    acc: LatticeAccumulator,
 }
 
 impl LtHash {
@@ -25,7 +25,7 @@ impl LtHash {
     }
 }
 
-impl<K: Key, V: Value> VectorCommitment<K, V> for LtHash {
+impl<K: Key> VectorCommitment<K> for LtHash {
     type State = LtHashState;
 
     fn scheme_id(&self) -> &'static str {
@@ -38,11 +38,20 @@ impl<K: Key, V: Value> VectorCommitment<K, V> for LtHash {
         }
     }
 
-    fn apply(&self, state: &mut Self::State, key: &K, old: Option<&Entry<V>>, new: Option<&Entry<V>>) {
-        todo!("acc.remove(encode(key, old)); acc.add(encode(key, new)); tombstones encoded distinctly from values")
+    fn apply(&self, state: &mut Self::State, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>) {
+        if let Some(entry) = old {
+            state.acc.remove_fields(&item_fields(key, entry));
+        }
+        if let Some(entry) = new {
+            state.acc.add_fields(&item_fields(key, entry));
+        }
     }
 
-    fn commitment(&self, state: &Self::State) -> Digest {
+    fn commitment<'a>(
+        &self,
+        state: &Self::State,
+        _entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>,
+    ) -> Digest {
         state.acc.digest()
     }
 }

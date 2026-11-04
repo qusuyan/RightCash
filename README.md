@@ -11,10 +11,66 @@ need no code changes.
 - `docs/TODO.md`: deferred work, including the firewood-side changes that
   would remove the per-step commit and rehashing costs.
 
-Status: milestone 0 done (design §13). The benchmark suite, the in-memory
-model engine and the vanilla firewood backend are implemented and tested;
-the auth_wal core (write set, policies, schemes, proposal tree, speculation)
-is a skeleton whose bodies are `todo!()`. Design v19 (§14) makes every
+The benchmark defaults to capacity **10,000**, low watermark **7,000 (70%)**,
+and high watermark **9,000 (90%)**. The high watermark starts precomputation;
+actual eviction waits until capacity is exceeded and drains to the low watermark.
+Prediction starts with a fixed **3,000-key window** (capacity minus low, plus
+any explicit margin). Later insertion hints do not enlarge it: FIFO ignores
+later hints, while LRU replaces hinted predicted keys with the next eligible
+candidates. Actual victims outside the window are handled at finalization.
+Percentages scale with `--capacity` and round down; explicit watermark flags override them.
+For Zipf, mixed-write, and single-key workloads, measurement requires set
+occupancy at least the low watermark after prefill/warm-up. Reports include
+`start_occupancy`; insufficient preparation fails with a configuration error.
+The `create` workload intentionally measures growth from an empty database.
+
+Status: milestones 0–2 done and reviewed through 2026-11-03 (design §13, §14;
+test coverage includes the policies, the set and its commitment
+oracles, the three schemes, the proposal tree and its lineage rules, the
+revision window, differential tests against a reference map and against
+the plain path, the engine contract on both backends, firewood smoke
+tests). The benchmark runs through auth_wal (`WriteSet`). Before it,
+milestone 0: the benchmark suite, the in-memory model engine and the
+vanilla firewood backend. First release-mode numbers (design §14, milestone
+1): on firewood's `zipf` auth_wal cuts storage ops per commit from 1000 to
+100 but its own set work costs about 8 ms per 1000-op batch at 10k entries,
+so throughput halves on a 50k-row database. On a populated trie
+(clarification 28, `--prefill`) the picture inverts: with the set at 10k,
+auth_wal is ahead of bare firewood from 100k rows on, by a third at 1M rows
+on `zipf`, because firewood's per-batch cost grows with the trie and the
+set's does not (design §12.13). Growing the set itself is another matter:
+at capacity 100k the per-proposal copy costs about 28 ms per block and 3.4
+GB for 128 revisions, so a larger set would need a different structure
+(design §12.13, §12.15). Milestone 2 (design §9, §14) turns speculation on:
+hints precompute a full eviction batch at a local high watermark, and
+predictions outlive the block. Actual eviction only occurs above capacity
+and drains to the low watermark; high watermark never enters the root.
+A fuzz test shows hints never change the eviction. The following historical
+measurements predate this watermark correction (design §6.2, R39). Against hinted blocks on a
+2.4M-row firewood the final proposal shrinks from 330–2120 storage ops to
+0–52 and the propose p99 from 115 to 18 ms. The per-phase latency
+breakdown (clarification 31, `--breakdown`, design §12.16 and §14) then
+shows where propose, the critical path, really goes: the set's own work
+(copy, lattice updates, eviction, policy digest) is 8.4–10.5 ms per block
+on `zipf` and 17.8–19.4 ms on `tenkrandom`, more than bare firewood's whole
+propose (7.1 and 15.9 ms) in every configuration; the engine side is cold
+puts of the evicted keys (17–22 µs each against 9 µs warm), which
+speculation moves off the path entirely once a step is built per hint
+(rounds 30, min_step 1: propose 10.2 ms on `zipf` and 20.7 ms on
+`tenkrandom`, all of it the set's own work); the chain's 14–75 ms commit
+is firewood's persistence backpressure (one unpersisted revision by
+default), off the critical path. The whole-set `rehash` commitment scheme
+(clarification 32, `--vc rehash`, design §7.2) then replaces the lattice's
+2.7–2.8 µs per item with one hash over the set, 0.7 ms per block: propose
+falls to 6.9 ms on `zipf` and 9.1 ms on `tenkrandom`, at or under bare
+firewood's. Clarification 33 then applied the proposals one step at a
+time (design §14): the policy digest from one buffer, the flat snapshot
+(sorted arrays and a value arena rebuilt by merge passes instead of B-tree
+copies) and the flat policy arrays take propose to 2.2 ms on `zipf` and
+3.1 ms on `tenkrandom`, a third and a fifth of bare firewood's; a block
+that evicts nothing now keeps the precomputed chain and the previous
+block's storage root (R35, exercised with `--hint-noise`), which
+halved the mean propose under the bulk rule with noisy hints on `zipf`, 16.4 to 9.0 ms (the 100 non-evicting blocks of 200 kept the chain and paid the set's work alone, about 2.5 ms, while the evicting half still pays about 15 ms of read-backs and reverts for the over-prediction itself, which only firewood-side changes remove, §12.10 (e)–(f)), and left `tenkrandom` unchanged, where every block evicts under either rule. The levers left are listed in `docs/TODO.md`. Design v19 (§14) makes every
 proposal a full copy of its parent's set (R20): a node is its snapshot, its
 pinned storage view and one weak parent link; there are no overlays, no chain
 reads and no replay-through-chain policy queries, and the redundancy pass
@@ -25,8 +81,7 @@ state from nodes and the registry: a node's storage ownership is handle
 identity and statistics are atomics counted at `Propose`; the registry is one
 deque of committed nodes in commit order (its newest entry is the head) and a
 flat live index for `Revision(root)` on live proposals, nothing else; the
-configuration is writer-owned and the closing flag doubles as the writer's
-closed flag. Design v21 (R22) keeps only what consensus and the interface
+configuration and the closed flag are writer-owned. Design v21 (R22) keeps only what consensus and the interface
 require: no lineage walk (`Commit` checks that the parent is the head,
 `Propose` builds on the head for an equal root and otherwise on the node as
 given, as firewood does), no ring clearing at close, no prefix-delete
@@ -45,8 +100,7 @@ policy: `writes` evicts and reconciles the policy's own marks, `hint_writes`
 says what to send early and what to put back, `state_digest` makes the
 policy state a root term again (a full hash per proposal), and the
 speculation machinery shrinks to a pending queue, a worker and a flush
-behind one lock. The registry mutex, the worker's queue mutex and the firewood
-handle lock are the only locks. Thirty-seven review rounds (rounds 30–35 on
+behind one lock. Thirty-seven review rounds (rounds 30–35 on
 R22–R24, 36–37 on R25; round 36 kept the target identity apart from the
 consumed working policy). Design v25 (R26) keeps the policy in the
 snapshot and lets hints mark it in place, drops warm jobs and the working
@@ -54,12 +108,83 @@ copy, and calls the speculative proposals steps. Design v26 (R27) makes the
 worker the owner of the speculative side of the engine: `submit` a batch,
 `finish` a block, `reset` at a retarget; a step is the merged write set of
 everything queued. Design v27 (R28) puts the worker on a `std::sync::mpsc`
-channel with `Submit`, `Reset` and `Finish` requests; the chain state is the
-thread's own. v25–v27 await review. Next step is milestone 1. The
+channel; the current terminal `Finish` also carries final reconciliation
+(see below). The chain state is the
+thread's own. The milestone-1 and milestone-2 implementations were
+reviewed on 2026-11-02 (clarification 34, design §14): a consensus hazard
+in R35's chain handover was fixed (the child that keeps the chain becomes
+the precomputation's target), the chain capped at `rounds` steps across
+kept blocks, and the experiments' leftovers removed; round 2 made `finish`
+answer nothing while submitted ops wait unbuilt on a full chain and the
+firewood adapter's first link hold the committed handle that pins its base
+revision, and pinned the consensus encodings with known answers; round 3
+made both engines compare a chain's base with the committed state by
+revision identity, never by root (firewood would free a node twice
+otherwise). The
 retraction of a speculative eviction (the final proposal puts back the
 value read through the parent's pinned view, design §9.1) is kept as is by
 decision; a firewood-side restore op is the recorded future change (design
-§12.10 (e), `docs/TODO.md`). Next step is milestone 1.
+§12.10 (e), `docs/TODO.md`). Next step is milestone 3 (the benchmark
+sweep).
+
+## Speculative proposal flow
+
+`Propose` sends the final eviction refinement to the worker in one terminal
+request. The worker merges it with pending hints before building at most one
+final storage proposal. If its latest view is already exact and there is no
+metadata, it returns that view directly. The validator does not build another
+correction proposal. Retractions still read the chain's original storage view.
+
+`--speculation-rounds` caps the complete chain, including its final proposal;
+early work uses at most `rounds - 1` slots. The engine revision window is
+`revisions × rounds` when the backend commits chain links separately. A
+non-evicting block keeps the chain asynchronously. An evicting block consumes
+it and starts the next prediction on the completed child, so competing
+siblings cannot reuse child-specific corrections.
+
+The library and benchmark default `speculation_min_step` to 256 distinct
+pending keys. `--speculation-min-step` overrides it; block-end flushes and
+finalization can build below this threshold.
+
+FIFO refreshes rewritten predictions when keeping a chain. At margin zero,
+its fixed oldest prefix needs no final retractions; nonzero margins can
+still require restoration. LRU restores withdrawn predictions and uses a
+forward candidate cursor, reset when writes rebuild its order. Its fixed
+budget survives kept blocks; false hints are corrected at finalization.
+
+Firewood's existing commit-permit setting is exposed as
+`--firewood-commit-permits`. Benchmark defaults allow one complete speculative
+chain (`--speculation-rounds`) to await persistence, or one revision for plain
+and baseline runs. The value must be positive and smaller than the engine
+revision window; CSV reports the resolved `firewood_commit_permits`. Direct
+`FirewoodConfig` retains the backend default of one permit. Firewood's commit
+behavior is unchanged; this configures its existing persistence queue.
+
+The adapter supports upstream Firewood v0.9.0 through its public dynamic API.
+`ethhash` selects Ethereum mode at database open; the default is MerkleDB.
+The permit limit maps to `max_persistence_gap`. Firewood can absorb a no-op
+commit, so adapter generations preserve the rule that each successful commit
+supersedes the previous head. The API requires owned key/value batches.
+
+## Initial set
+
+`AuthWal::new(config, storage, set)` consumes the complete
+`set::Snapshot<K, V, C, P>`: entries, policy state, commitment scheme and
+capacity. It derives root parameters from that set, and rejects a capacity
+mismatch with `config`. Storage must still be fresh.
+
+Use `Snapshot::empty(vc, policy, capacity)?` for the existing empty-genesis
+behavior, or `Snapshot::from_entries(vc, policy, capacity, entries)?` for a
+populated initial set. Entries are `(key, Entry::Value(value))` or
+`(key, Entry::Tombstone)`; repeated keys use the last entry. Supply a fresh
+policy to the builder, which fills its key space through the normal write path.
+The resulting set exposes no independent policy mutation.
+
+A populated initial set is equivalent to one initial batch: height 1 and a
+content-dependent root, with all initial entries retained in memory. An empty
+set remains height 0 with `EMPTY_ROOT`. Initial entries do not count as runtime
+writes in statistics. This supports initialization, not recovery of a prior
+database or historical policy ordering.
 
 ## Benchmarks
 
@@ -72,7 +197,7 @@ B=target/release/auth_wal-benchmark
 # workloads on it (create truncates; the others reopen what create left).
 $B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 create
 $B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 --iterations 200 --warmup-batches 20 zipf
-$B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 --iterations 200 ten-k-random
+$B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 --iterations 200 tenkrandom
 $B --baseline --engine firewood --dbname /tmp/fwbench -b 1000 --iterations 500 single
 # The in-memory firewood model needs no path.
 $B --baseline --engine memory -b 10000 -n 100 create
@@ -81,20 +206,22 @@ $B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 --iterati
 ```
 
 Each run prints a CSV header and one record to stdout (progress to stderr),
-so sweeps can be concatenated and plotted. Defaults follow requirement R16:
-a 10k-entry write set that evicts down to half; typical blocks write under 2k
+so sweeps can be concatenated and plotted. By default each invocation chooses
+a random seed, printed to stderr at startup and included in the CSV `seed`
+column. Pass `--seed <reported-seed>` to reproduce the workload, hint gaps and
+hint noise with the same configuration. Defaults follow requirement R16:
+a 10k-entry write set that evicts down to 7,000 entries; typical blocks write under 2k
 entries, so sweeps also run `-b 2000`. Without `--baseline` the workload
-runs through auth_wal, which lands with milestone 1. `--help` lists every
-knob (capacity, policy, scheme, speculation rounds/margin, hints, synthetic
-storage latency, seed).
+runs through auth_wal. `--help` lists every knob (capacity, policy, scheme,
+speculation rounds/margin, hints and hint noise, synthetic storage latency,
+seed, the per-phase breakdown).
 
 ```bash
 cargo check --workspace --all-features            # lib + benchmark
 cargo check -p auth_wal --features firewood        # firewood backend (path dependency on ../firewood); -p: the benchmark enables it
-cargo test  --workspace --all-features             # lattice + engine contract tests (memory and firewood)
+cargo test  --workspace --all-features             # the whole battery (firewood contract and smoke tests included)
 cargo clippy --workspace --all-features --all-targets
 cargo doc -p auth_wal --no-deps --all-features
 cargo fmt --all -- --check                        # rustfmt.toml: max_width = 120
-cargo build --release                             # target/release/libauth_wal.a for the Go shim
-cargo bench -p auth_wal --bench lattice           # micro-benchmarks: accumulator, per-proposal copy, sync primitives, engine propose
+cargo build --release --workspace                 # the benchmark binary; the staticlib for the Go shim arrives with milestone 4
 ```

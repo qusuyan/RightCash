@@ -10,19 +10,22 @@ use std::sync::Arc;
 /// blanket impl below. `Borrow<[u8]>` lets the memory model's ordered map
 /// position its prefix-delete range scan (`MemoryStorage`; the set itself
 /// has no range scan, R22); it makes `get(&K)` on the std maps ambiguous, so
-/// lookups by `&K` name the key type (`map.get::<K>(key)`). Only the
-/// commitment scheme needs the bytes. Both
-/// keys and values should be **cheap to clone**: every proposal copies the
-/// whole set (design §4, R20), so the FFI layer uses `Arc<[u8]>` for both
-/// (one reference count per clone) and fixed-size arrays are inline.
+/// lookups by `&K` name the key type (`map.get::<K>(key)`). Commitments, policy
+/// digests, and storage adapters consume the byte representation.
+/// Keys should be cheap to clone because each proposal rebuilds its record
+/// array. Retained value bytes are shared in arena chunks; owned `V` values
+/// are reconstructed for reads and evictions. Cheap value clones can still
+/// help storage adapters and speculative batches.
 /// Blanket-implemented for the byte containers the FFI layer and the
 /// benchmarks use (design §4, "Generic key and value types").
 pub trait Key: Clone + Eq + Ord + AsRef<[u8]> + Borrow<[u8]> + Send + Sync + 'static {}
 
-/// Bound for value types; see [`Key`]. `from_bytes` lets a storage adapter
-/// rebuild a value from the engine's bytes; for a fixed-size array a length
-/// mismatch is corrupted data and panics.
+/// Bound for owned values; see [`Key`]. Snapshots and storage adapters rebuild
+/// values from bytes through `from_bytes`.
 pub trait Value: Clone + Eq + AsRef<[u8]> + Send + Sync + 'static {
+    /// Return an owned value with the same bytes as `bytes`, independent of the
+    /// input's lifetime. The fixed-size-array implementation panics unless the
+    /// input length matches the array; heap-backed implementations copy bytes.
     fn from_bytes(bytes: &[u8]) -> Self;
 }
 
@@ -55,19 +58,30 @@ impl<const N: usize> Value for [u8; N] {
 /// Length of a root in bytes.
 pub const ROOT_LENGTH: usize = 32;
 
+/// A field's `u32 LE` length prefix, the delimiter of every hashed item
+/// (design §7.2, §7.3). A field of 4 GiB or more is refused: its prefix
+/// would be a shorter field's.
+pub(crate) fn len_prefix(len: usize) -> [u8; 4] {
+    u32::try_from(len)
+        .expect("a hashed field is shorter than 4 GiB")
+        .to_le_bytes()
+}
+
 /// A 32-byte digest that is *not* a root: a set commitment, a parameter
 /// digest, a metadata hash (design §7.3).
 pub type Digest = [u8; ROOT_LENGTH];
 
-/// An opaque 32-byte combined root (design §7.3). Never comparable with
-/// Ethereum MPT roots, QMDB roots or firewood roots. Deliberately not
-/// `Default`: there is no meaningful zero root.
+/// A 32-byte root wrapper used for both combined auth_wal roots and adapter
+/// storage roots. The type does not distinguish those domains; callers must
+/// track which kind they hold. A combined root authenticates more than the
+/// storage trie alone. No `Default`: zero bytes are not the empty-root sentinel.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, StdHash, Debug)]
 pub struct Hash(pub [u8; ROOT_LENGTH]);
 
-/// Root reported while nothing has been committed: Ethereum's empty-root
-/// constant `keccak256(rlp(""))`, matching `qmdb-ffi` so the adapter's genesis
-/// idiom holds (design §3, §7.3).
+/// Sentinel for auth_wal's height-zero initial state and a backend's empty
+/// storage state. A supplied nonempty snapshot has a combined root immediately,
+/// before its first commit. Uses Ethereum's empty-root constant
+/// `keccak256(rlp(""))`, matching `qmdb-ffi` (design §3, §7.3).
 pub const EMPTY_ROOT: Hash = Hash([
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e, 0x5b, 0x48, 0xe0,
     0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
@@ -93,6 +107,16 @@ pub enum BatchOp<K, V> {
     PrefixDelete {
         prefix: Box<[u8]>,
     },
+}
+
+impl<K, V> BatchOp<K, V> {
+    /// The key a `Put` or `Delete` is about; `None` for a `PrefixDelete`.
+    pub fn key(&self) -> Option<&K> {
+        match self {
+            BatchOp::Put { key, .. } | BatchOp::Delete { key } => Some(key),
+            BatchOp::PrefixDelete { .. } => None,
+        }
+    }
 }
 
 /// Errors surfaced through the public API and the C ABI. Mirrors the

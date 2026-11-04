@@ -4,7 +4,7 @@
 //! costs O(batch)), chained proposals committed one at a time (each its own
 //! revision, like firewood), a window of K revisions, the firewood adapter's
 //! handle shapes (the parent link inside the handle's lock, the
-//! committed-handle `propose` with its before-and-after root check, `head`,
+//! committed-handle `propose` with its before-and-after revision check, `head`,
 //! consumed handles after a failed commit, `ActiveHandles` from `close`), and
 //! an optional synthetic per-op latency so benchmarks and tests can open a
 //! window the real engine's hashing time would.
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 
-use crate::lattice::{LANES, LatticeAccumulator};
+use crate::lattice::LatticeAccumulator;
 use crate::storage::{StorageEngine, StorageProposal};
 use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
 
@@ -26,8 +26,9 @@ pub struct MemoryConfig {
     /// Committed revisions readable through committed handles before they go
     /// `RevisionStale`.
     pub revisions: usize,
-    /// Artificial delay added per op in `propose` and per `commit`; zero
-    /// disables it. Affects latency only, never roots.
+    /// Artificial delay per batch op (at least one delay even for an empty
+    /// batch) in `propose`, and per chain link committed. Zero disables it.
+    /// Affects latency only, never roots.
     pub op_latency: Duration,
 }
 
@@ -42,7 +43,7 @@ impl Default for MemoryConfig {
 
 fn sleep(latency: Duration, ops: usize) {
     if !latency.is_zero() {
-        std::thread::sleep(latency * ops.max(1) as u32);
+        std::thread::sleep(latency.saturating_mul(u32::try_from(ops.max(1)).unwrap_or(u32::MAX)));
     }
 }
 
@@ -91,7 +92,7 @@ impl<K: Key, V: Clone> PersistentMap<K, V> {
 struct State<K, V> {
     map: PersistentMap<K, V>,
     /// Incremental digest of `map`; `root` is derived from it.
-    acc: LatticeAccumulator<LANES>,
+    acc: LatticeAccumulator,
     root: Hash,
     /// Commit sequence number, set once at commit (the `State` is shared
     /// behind `Arc` with child proposals, hence write-once interior
@@ -109,8 +110,11 @@ impl<K: Key, V: Value> State<K, V> {
         }
     }
 
-    /// Applies `batch` to a copy of this state; the root is a function of the
-    /// resulting map alone (`EMPTY_ROOT` when empty).
+    /// Return a new uncommitted state with borrowed `batch` applied in order.
+    /// Clone the persistent map and accumulator, then apply puts, deletes, and
+    /// prefix deletes; repeated keys therefore use their final operation.
+    /// The original state is unchanged and the returned commit sequence is
+    /// unset. Derive the root from the final accumulator (`EMPTY_ROOT` if zero).
     fn apply(&self, batch: &[BatchOp<K, V>]) -> Self {
         let mut map = self.map.clone();
         let mut acc = self.acc.clone();
@@ -166,7 +170,8 @@ impl<K: Key, V: Value> EngineInner<K, V> {
         self.committed = state;
     }
 
-    /// Committed, and more than `revisions` commits ago.
+    /// Return whether committed `state` falls outside the latest `revisions`
+    /// sequence numbers. An uncommitted state (no sequence number) is not stale.
     fn is_stale(&self, state: &State<K, V>) -> bool {
         state.seq.get().is_some_and(|seq| seq + self.revisions < self.next_seq)
     }
@@ -362,6 +367,8 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
         if self.inner.committed.load(Ordering::Acquire) && self.inner.engine.read().is_stale(&self.inner.state) {
             return Err(Error::RevisionStale);
         }
+        // The temporary engine read guard above is gone before this handle
+        // lock, preserving the handle-then-engine lock order used by commit.
         let _shared = self.inner.handle.read();
         Ok(self.inner.state.map.get(key).cloned())
     }
@@ -375,8 +382,8 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
         self.inner.check_failed()?;
         if self.inner.committed.load(Ordering::Acquire) {
             // Contract item 4: on the committed state, provided this handle's
-            // root is the committed root before and after (equal roots mean
-            // equal state here, as on firewood); `ProposalOrphaned` otherwise;
+            // revision is the current revision by identity before and after;
+            // equal roots alone are insufficient. `ProposalOrphaned` otherwise;
             // `Closed` once the engine is closed.
             let head = {
                 let engine = self.inner.engine.read();
@@ -385,12 +392,14 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
                 }
                 engine.committed.clone()
             };
-            if head.root != self.inner.state.root {
+            if !Arc::ptr_eq(&head, &self.inner.state) {
                 return Err(Error::ProposalOrphaned);
             }
             let state = Arc::new(head.apply(batch));
             sleep(self.op_latency, batch.len());
-            if self.inner.engine.read().committed.root != self.inner.state.root {
+            // Building may overlap a commit. Reject the newly built proposal
+            // if its pinned base ceased to be the head, even with the same root.
+            if !Arc::ptr_eq(&self.inner.engine.read().committed, &self.inner.state) {
                 return Err(Error::ProposalOrphaned);
             }
             return Ok(self.child(state, head, None));
@@ -408,7 +417,7 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
         if self.inner.committed.load(Ordering::Acquire) {
             return Err(Error::ProposalConsumed);
         }
-        // Collect the uncommitted chain, oldest first.
+        // Follow parent links newest-to-oldest, then reverse for commit order.
         let mut chain = vec![self.inner.clone()];
         loop {
             let parent = chain.last().expect("non-empty").handle.read().clone();
@@ -441,6 +450,9 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
             Some(p) => p.state.clone(),
             None => oldest.base.clone(),
         };
+        // By identity, as the firewood adapter checks (its module doc): a
+        // same-root revision committed meanwhile is another revision, and a
+        // chain built on the superseded one is refused.
         if !Arc::ptr_eq(&head, &engine.committed) {
             // Firewood commits oldest-first and consumes the proposal whose
             // commit failed: the oldest handle is dead from now on (contract
