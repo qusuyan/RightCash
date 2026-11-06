@@ -137,7 +137,7 @@ Future changes, in order of value:
   panic into an error); the `Poisoned` path has no test because the
   memory engine commits a chain atomically (a fault-injection knob would
   model firewood's one-commit-per-step failure; the test engine of
-  `tests::faulty` injects propose and read failures, not mid-chain commit
+  `tests::faults` injects propose and read failures, not mid-chain commit
   failures); `Prediction::refresh` and `withdraw` could be one list
   handled one way at the price design §9.1 weighed; `chains_kept` counts
   a kept block whose chain was already dead (a failed step leaves no
@@ -178,7 +178,11 @@ Future changes, in order of value:
 - Evaluate the speculation defaults in the milestone-3 sweep (design §9.2,
   §12.5). `min_step` is now 256 following the focused Zipf comparison;
   broader tuning of `rounds` and `margin` remains open.
-- Bootstrap/durability before any validator may restart (design §12.6).
+- Crash recovery and state sync (design §12.6). Clean-shutdown checkpointing
+  now restores the latest committed set and policy against matching storage.
+  It does not provide per-commit durability or an atomic transaction between
+  the checkpoint file and storage; unexpected termination still needs a WAL,
+  replay, or storage rollback protocol.
 - Milestone 1 target (design §12.13, decided R16/R18/R20): per-write
   overhead of the write set (entry insert, commitment update, policy update)
   near 0.5 µs and the per-proposal copy around 2 ms at 10k entries (1.9 ms

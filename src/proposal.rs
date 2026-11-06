@@ -24,7 +24,7 @@ use std::sync::{Arc, Weak};
 use crate::policy::EvictionPolicy;
 use crate::set::{Entry, Snapshot};
 use crate::storage::{StorageEngine, StorageProposal};
-use crate::types::{Hash, Key, Result, Value};
+use crate::types::{Digest, Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
 pub(crate) type NodeRef<K, V, C, P, S> = Arc<Node<K, V, C, P, S>>;
@@ -72,10 +72,10 @@ where
     /// A failed engine commit poisons the instance iff this is non-zero
     /// (design §9.2).
     steps: u32,
-    /// `root::Terms::combine` over the node's terms, computed by `propose`
-    /// (the metadata hash among them is not kept: a proof, design §7.4,
-    /// will take it from the caller, milestone 5).
+    /// `root::Terms::combine` over the node's terms, computed by `propose`.
     root: Hash,
+    /// Retained to verify the combined root when recovering a checkpoint.
+    metadata_hash: Digest,
 }
 
 impl<K, V, C, P, S> Node<K, V, C, P, S>
@@ -99,6 +99,7 @@ where
         storage_view: StorageView<K, V, S>,
         steps: u32,
         root: Hash,
+        metadata_hash: Digest,
     ) -> NodeRef<K, V, C, P, S> {
         Arc::new(Self {
             snapshot,
@@ -106,11 +107,16 @@ where
             storage_view,
             steps,
             root,
+            metadata_hash,
         })
     }
 
     pub(crate) fn root(&self) -> Hash {
         self.root
+    }
+
+    pub(crate) fn metadata_hash(&self) -> Digest {
+        self.metadata_hash
     }
 
     pub(crate) fn height(&self) -> u64 {

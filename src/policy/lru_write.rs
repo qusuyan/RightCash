@@ -121,6 +121,20 @@ impl<K: Key> LruWrite<K> {
 }
 
 impl<K: Key> EvictionPolicy<K> for LruWrite<K> {
+    fn encode_state(&self, keys: &[K]) -> Result<Vec<u8>> {
+        super::encode_heights(&self.index, keys)
+    }
+
+    fn restore_state(&mut self, bytes: &[u8], keys: &[K], height: u64) -> Result<()> {
+        let index = super::decode_heights(bytes, keys, height)?;
+        let mut order: Vec<_> = index.iter().map(|(key, height)| (*height, key.clone())).collect();
+        order.sort_unstable();
+        self.index = Arc::new(index);
+        self.order = Arc::new(order);
+        self.reset_hints();
+        Ok(())
+    }
+
     /// Apply one batch's writes to this policy and return its eviction decision.
     /// `keys` contains one key per put/delete in execution order; duplicates
     /// are allowed and tombstones count as present. `height` is the new block's

@@ -30,9 +30,9 @@ pub const DOMAIN: &[u8] = b"auth_wal/v1";
 /// The preimage's static terms (design §7.3): computed once at `new` from
 /// the scheme, the policy and the engine and kept on the writer; no node
 /// changes them. [`Terms::combine`] adds a node's own
-/// terms and hashes. A node keeps its root only: a proof (milestone 5) takes
-/// the metadata from the caller and rebuilds the preimage with `combine`
-/// (design §7.4, §8).
+/// terms and hashes. A node keeps its root and metadata hash, allowing a
+/// checkpoint to verify the preimage on recovery. A proof (milestone 5)
+/// still takes the metadata bytes from the caller (design §7.4, §8).
 #[derive(Clone, Debug)]
 pub struct Terms {
     pub scheme_id: &'static str,

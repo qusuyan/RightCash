@@ -555,7 +555,7 @@ impl FwProposal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::TempDir;
+    use crate::tests::common::TempDir;
 
     #[test]
     fn firewood_rejects_head_change_before_generation_publication() {

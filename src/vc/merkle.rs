@@ -165,7 +165,7 @@ mod tests {
 
     use super::*;
     use crate::set::Entry;
-    use crate::tests::Rng;
+    use crate::tests::common::Rng;
 
     type K = Vec<u8>;
     type V = Vec<u8>;

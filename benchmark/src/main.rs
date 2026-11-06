@@ -307,6 +307,7 @@ fn wal_config(g: &GlobalOpts) -> Config {
     Config {
         consensus: Consensus { capacity: g.capacity },
         local: Local {
+            snapshot_path: None,
             revisions: g.revisions,
             speculate: g.speculate,
             speculation_rounds: g.speculation_rounds,

@@ -22,6 +22,7 @@ chacha20 = "0.10"
 parking_lot = "0.12"
 thiserror = "2"
 log = "0.4"
+tempfile = "3"
 firewood = { path = "../firewood/firewood", optional = true }
 firewood-storage = { path = "../firewood/storage", optional = true }
 

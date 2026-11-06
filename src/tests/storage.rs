@@ -2,8 +2,8 @@
 //! property), run against every backend: `MemoryStorage` always, firewood
 //! behind its feature in a temporary directory.
 
-use super::*;
-use crate::tests::{del, k, put};
+use crate::storage::*;
+use crate::tests::common::{del, k, put};
 use crate::types::{BatchOp, EMPTY_ROOT, Error};
 
 type K = Vec<u8>;
@@ -540,7 +540,7 @@ mod firewood_backend {
 
     use super::*;
     use crate::storage::firewood::{FirewoodConfig, FirewoodStorage};
-    use crate::tests::TempDir;
+    use crate::tests::common::TempDir;
 
     thread_local! {
         /// Databases this test thread created, removed by `Cleanup`.

@@ -51,6 +51,37 @@ pub(crate) fn params_digest(low_watermark: usize) -> Digest {
     hasher.finalize().into()
 }
 
+/// Snapshot encoding shared by FIFO and LRU: one u64 LE height for each
+/// snapshot key. Keys are stored once, in the snapshot's entry section.
+fn encode_heights<K: Key>(index: &[(K, u64)], keys: &[K]) -> Result<Vec<u8>> {
+    if index.len() != keys.len() || index.iter().zip(keys).any(|((key, _), expected)| key != expected) {
+        return Err(Error::InvalidSnapshot("policy and snapshot key sets differ".into()));
+    }
+    Ok(index.iter().flat_map(|(_, height)| height.to_le_bytes()).collect())
+}
+
+/// Decode and validate heights, returning the key-sorted index. Callers
+/// reconstruct eviction order by sorting (height, key) pairs.
+fn decode_heights<K: Key>(bytes: &[u8], keys: &[K], height: u64) -> Result<Vec<(K, u64)>> {
+    if bytes.len() / 8 != keys.len() || !bytes.len().is_multiple_of(8) {
+        return Err(Error::InvalidSnapshot(
+            "policy height count differs from entry count".into(),
+        ));
+    }
+    keys.iter()
+        .zip(bytes.chunks_exact(8))
+        .map(|(key, bytes)| {
+            let written = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
+            if written == 0 || written > height {
+                return Err(Error::InvalidSnapshot(
+                    "policy height is outside the snapshot's history".into(),
+                ));
+            }
+            Ok((key.clone(), written))
+        })
+        .collect()
+}
+
 /// Check entry-count parameters without mutating them: `low_watermark` is the
 /// target occupancy after eviction, `trigger` is an optional prediction-start
 /// occupancy, and `capacity` is the maximum retained entry count.
@@ -256,6 +287,28 @@ pub struct Eviction<K> {
 /// policies share immutable input arrays when cloned, then build the child's
 /// arrays once in `writes` (design §12.17 (a)); prediction marks are copied.
 pub trait EvictionPolicy<K: Key>: Clone + Send + Sync + 'static {
+    /// Encode consensus state for clean-shutdown recovery. `keys` is the
+    /// snapshot's complete key set in sorted order. Exclude prediction state.
+    /// Custom policies must implement this and `restore_state` to enable
+    /// `Local::snapshot_path`; in-memory operation needs neither method.
+    fn encode_state(&self, _keys: &[K]) -> Result<Vec<u8>> {
+        Err(Error::InvalidConfig(format!(
+            "policy {} does not support snapshots",
+            self.name()
+        )))
+    }
+
+    /// Replace consensus state from `encode_state`, retaining this instance's
+    /// parameters. Validate that the state describes exactly `keys` at `height`.
+    /// Clear all hints and predictions. The caller separately checks parameters
+    /// and recomputes the combined root before exposing the recovered instance.
+    fn restore_state(&mut self, _bytes: &[u8], _keys: &[K], _height: u64) -> Result<()> {
+        Err(Error::InvalidConfig(format!(
+            "policy {} does not support snapshots",
+            self.name()
+        )))
+    }
+
     /// Update policy state for one batch and return its eviction decision.
     ///
     /// - `keys`: one key for each put or delete, in batch execution order,

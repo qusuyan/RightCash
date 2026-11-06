@@ -347,6 +347,75 @@ where
         self.capacity
     }
 
+    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = (&K, EntryRef<'_>)> {
+        entry_refs(&self.entries, &self.arena)
+    }
+
+    pub(crate) fn encode_policy(&self) -> Result<Vec<u8>> {
+        let keys: Vec<_> = self.entries.iter().map(|record| record.key.clone()).collect();
+        self.policy.lock().encode_state(&keys)
+    }
+
+    /// Rebuild commitment and arena from validated, sorted checkpoint entries.
+    /// Restore policy heights directly; replaying one write batch would erase
+    /// their original ages and change future eviction decisions.
+    pub(crate) fn restore(
+        vc: C,
+        mut policy: P,
+        capacity: usize,
+        height: u64,
+        entries: Entries<K, V>,
+        policy_state: &[u8],
+    ) -> Result<Self> {
+        if entries.len() > capacity || entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(Error::InvalidSnapshot(
+                "entries must be sorted, distinct, and within capacity".into(),
+            ));
+        }
+        if height == 0 && !entries.is_empty() || height == u64::MAX {
+            return Err(Error::InvalidSnapshot("invalid snapshot height".into()));
+        }
+        // The arena uses u32 offsets; reject oversized input before normalise.
+        let total = entries.iter().try_fold(0u32, |sum, (_, entry)| match entry {
+            Entry::Tombstone => Some(sum),
+            Entry::Value(value) => sum.checked_add(u32::try_from(value.as_ref().len()).ok()?),
+        });
+        if total.is_none() {
+            return Err(Error::InvalidSnapshot(
+                "snapshot values exceed the arena size limit".into(),
+            ));
+        }
+        policy.validate(capacity)?;
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.clone()).collect();
+        policy.restore_state(policy_state, &keys, height)?;
+        policy.reset_hints();
+        let policy_digest = policy.state_digest();
+        let batch = entries
+            .into_iter()
+            .map(|(key, entry)| match entry {
+                Entry::Value(value) => BatchOp::Put { key, value },
+                Entry::Tombstone => BatchOp::Delete { key },
+            })
+            .collect();
+        let mut arena = Arena::empty();
+        let (_, ops, mut summary) = normalise(batch, &mut arena);
+        let mut commitment = vc.empty();
+        let (entries, _) = merge::<K, V, C>(&[], &ops, &[], &mut arena, &vc, &mut commitment, &mut summary);
+        let commitment_digest = vc.commitment(&commitment, entry_refs(&entries, &arena));
+        Ok(Self {
+            entries,
+            arena,
+            policy: Mutex::new(policy),
+            policy_digest,
+            vc,
+            commitment,
+            commitment_digest,
+            height,
+            capacity,
+            _value: PhantomData,
+        })
+    }
+
     /// Design §5 step 1: one binary search over the records, the entry
     /// rebuilt from its bytes.
     pub fn get(&self, key: &K) -> Option<Entry<V>> {
@@ -700,7 +769,7 @@ mod tests {
 
     use super::*;
     use crate::policy::{Eviction, Fifo, LruWrite, Prediction};
-    use crate::tests::Rng;
+    use crate::tests::common::Rng;
     use crate::vc::lthash::LtHash;
     use crate::vc::merkle::Merkle;
     use crate::vc::rehash::Rehash;

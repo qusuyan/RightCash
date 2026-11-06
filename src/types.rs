@@ -148,13 +148,15 @@ pub enum Error {
     PrefixDeleteUnsupported,
     #[error("database is closed")]
     Closed,
-    /// v0 opens only over an engine with nothing committed (design §1, §12.6).
-    #[error("storage engine already has committed state; v0 requires a fresh engine")]
+    /// `new` requires fresh storage; use `recover` for a saved snapshot.
+    #[error("storage engine already has committed state; use recover with its snapshot")]
     EngineNotFresh,
     /// A speculative chain failed part-way through its one-at-a-time engine
     /// commits, leaving the engine head at a state no node owns (design §9.2).
     /// `Propose`/`Commit` refuse from then on: halt rather than diverge.
-    #[error("instance poisoned by a failed mid-chain commit: {0}")]
+    /// Also used after a storage-close failure to prevent publication of a
+    /// checkpoint when the engine's durability is uncertain.
+    #[error("instance poisoned by a failed storage operation: {0}")]
     Poisoned(String),
     /// The storage engine refused to close because a live (uncommitted, not
     /// failed) storage proposal is still held (design §10 item 6): a Rust
@@ -170,6 +172,10 @@ pub enum Error {
     InvalidConfig(String),
     #[error("storage engine error: {0}")]
     Storage(String),
+    #[error("snapshot I/O error: {0}")]
+    SnapshotIo(#[from] std::io::Error),
+    #[error("invalid snapshot: {0}")]
+    InvalidSnapshot(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

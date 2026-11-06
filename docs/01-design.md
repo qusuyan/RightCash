@@ -1,6 +1,8 @@
 # auth_wal design
 
-Status: DESIGN v35 (2026-11-03). Watermark semantics corrected by R39 (§6.2):
+Status: DESIGN v36 (2026-11-03). Clean-shutdown persistence and recovery
+save the latest committed snapshot and restore it against matching storage
+(R41, §12.6). Watermark semantics corrected by R39 (§6.2):
 the high watermark is local and starts precomputation only; actual eviction
 uses capacity and the low watermark. Historical benchmark sections describing
 an incremental high-watermark eviction rule predate this correction.
@@ -150,16 +152,18 @@ Non-goals
 
 v0 limitations (explicit, consensus-relevant)
 
-- **Everything is in memory** (R10). The set contents *and* the policy state
+- **The live set is in memory** (R10, extended by R41). The set contents *and* the policy state
   are consensus state: two validators with different set contents produce
   different roots. Every validator must supply the same initial set. An empty
   initial set starts at height 0; a seeded set starts at height 1, equivalent
-  to one initial batch. Recovery of historical state is unsupported;
+  to one initial batch. `Close` can checkpoint the latest committed state to
+  `Local::snapshot_path`; `Recover` restores it against the same storage
+  (§12.6). Historical revisions and crash recovery remain unsupported.
   `New` rejects an engine that already has committed
   state (`EngineNotFresh`), because the adapter keys `Initialized()` on
-  `Root() != EmptyRoot` and would otherwise re-run genesis over it. A restart or a state-sync is a consensus-state recovery
-  problem (replay from genesis, or a replicated snapshot) and is deferred
-  (§12.6).
+  `Root() != EmptyRoot` and would otherwise re-run genesis over it. Reopening
+  after a successful close uses `Recover`; crash recovery and state sync need
+  a separate durability protocol (§12.6).
 - Roots are **history-bound**: they include the block height and the
   policy's state digest (its eviction order, by write height for the v0
   policies, §6.1, §7.3), so the same key-value contents reached by different
@@ -218,6 +222,7 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 | Symbol | Behaviour in auth_wal |
 |---|---|
 | `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `AuthWal::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes auth_wal's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; `EngineNotFresh` if the engine already has committed state (§1); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
+| `Recover` (Rust) | `AuthWal::recover(config, storage, vc, policy)` restores `Local::snapshot_path` with matching, reopened storage. Validates the file and reconstructed root, installs the latest committed node, and starts fresh local speculation. See §12.6. |
 | `Update(batch)` / `UpdateWithMetadata` | `Propose` + `Commit` in one call. |
 | `Propose(batch)` / `ProposeWithMetadata` | Copies the parent's set and applies the batch to the copy (§4), the policy evicts if over capacity (§6.1), creates the storage proposal for the evicted writes, returns a `Proposal` whose `Root()` is known immediately (§8). `Root()` is a single 32-byte commitment combining the set commitment, the policy digest and the storage root (§7.3); none of them is exposed separately. Metadata is root-affecting (it enters the preimage; `None` and `Some(empty)` are distinct, as in `qmdb-ffi`) and is also carried by the node's own storage proposal when one exists (on the speculative path, the worker's final proposal; early steps never carry metadata, §9.1). |
 | `Proposal.Get` | Its snapshot, then its pinned storage view (§5); one lookup, no lock on the set side (the storage read takes the adapter's handle read guard, §10 (e)). |
@@ -229,7 +234,7 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 | `Root` | Combined root of the committed state (§7.3). `EmptyRoot` is the Ethereum empty-root constant, as in `qmdb-ffi`, reported for an empty height-zero initial set; a seeded set has an authenticated root immediately (§4), so the empty-start adapter's genesis idiom (`Initialized()`, `Revision(EmptyRootHash)`) keeps working. |
 | `Revision(root)` / `LatestRevision` | Resolves the last K committed revisions, then live proposals, under one registry hold; in Rust the result is the same `Handle` type a `Propose` returns (§8). `ErrRevisionNotFound` for an unknown root; `ErrRevisionStale` from `Revision.Get` only when its pinned storage view has left the engine's window: every node owns its snapshot, so set reads never go stale, and an orphan reads its own copy exactly, however many commits later (§5, §8). |
 | `Prune`, `GatherMetrics`, `Gatherer`, `StartMetrics*` | Pass-through / composition. |
-| `Close(ctx)` | Mirrors `qmdb-ffi`: the Go layer waits for its outstanding `Proposal`/`Revision` handles until `ctx` expires (its own keep-alive count, as in `qmdb-ffi`'s `keepalive.go`), then returns `ErrActiveKeepAliveHandles`; otherwise it calls the Rust `AuthWal::close(&mut self)`, a writer operation, which sets the closing flag (`Propose`, `Commit` and `Update` report `Closed` from then on; hints are no-ops), drops the worker's channel and joins it (the step being built finishes, the requests it had already drained are handled, which may build one more step, and nothing is answered, §9.2; the thread's chain, the only speculative engine proposals, drops with it; the writer holds none), and closes the engine through the writer's exclusive reference, which succeeds because committed proposals and revisions do not pin it and reports `ActiveHandles` if a Rust caller still holds a handle to an uncommitted proposal with its own storage proposal (§10 item 6). Reads through handles and `Reader`s keep working afterwards, retained revisions included (a snapshot is memory, a committed engine view stays readable; the Rust side keeps no closed flag for reads, R20; the registry is released with the instance, R22), and `Root` keeps answering with the last committed root. Idempotent; allowed on a poisoned instance. |
+| `Close(ctx)` | Mirrors `qmdb-ffi`: the Go layer waits for its outstanding `Proposal`/`Revision` handles until `ctx` expires (its own keep-alive count, as in `qmdb-ffi`'s `keepalive.go`), then returns `ErrActiveKeepAliveHandles`; otherwise it calls the Rust `AuthWal::close(&mut self)`, a writer operation, which sets the closing flag (`Propose`, `Commit` and `Update` report `Closed` from then on; hints are no-ops), drops the worker's channel and joins it (the step being built finishes, the requests it had already drained are handled, which may build one more step, and nothing is answered, §9.2; the thread's chain, the only speculative engine proposals, drops with it; the writer holds none), and closes the engine through the writer's exclusive reference, which succeeds because committed proposals and revisions do not pin it and reports `ActiveHandles` if a Rust caller still holds a handle to an uncommitted proposal with its own storage proposal (§10 item 6). Reads through handles and `Reader`s keep working afterwards, retained revisions included (a snapshot is memory, a committed engine view stays readable; the Rust side keeps no closed flag for reads, R20; the registry is released with the instance, R22), and `Root` keeps answering with the last committed root. With `Local::snapshot_path`, saves the committed head through the ordered checkpoint protocol in §12.6. Successful close is idempotent; a poisoned instance can close storage but cannot publish a checkpoint. |
 | `BatchOp`: `Put`, `Delete`, `PrefixDelete` | `Put`/`Delete` land in the set. `PrefixDelete` is rejected by `Propose` (`PrefixDeleteUnsupported`), as QMDB rejects it behind qmdb-ffi: a bounded set cannot apply a prefix delete to the keys it does not hold, forwarding it would need a storage proposal and ordering rules of its own, and the adapter never emits it (it bumps storage generations instead; R22). The engines keep supporting the op (§10). |
 | Proofs (`ProveLatest` / `VerifyLatest`) | Milestone 5 (§7.4); nothing of it exists in v0 code. Not used by the adapter. |
 | `NodeHashAlgorithm`, `CacheStrategy`, legacy options | Accepted; forwarded to a firewood backend, ignored otherwise, exactly like `qmdb-ffi`. |
@@ -280,7 +285,8 @@ the set capacity, the eviction policy with its parameters (the v0 policies'
 low watermark), the commitment
 scheme and the storage engine, which are therefore consensus parameters and must be identical
 on every validator; proposing on a node that can no longer be committed is accepted, its child never commits; `New`
-requires a fresh engine (v0); `Prefetch` is an addition; on firewood the
+requires a fresh engine, while `Recover` requires a matching checkpoint;
+`Prefetch` is an addition; on firewood the
 engine's read-cache strategy is forced to cache all reads (§9.4), overriding
 `WithReadCacheStrategy`. Speculation and its rounds are local settings.
 
@@ -301,7 +307,9 @@ height 0 and `EMPTY_ROOT`. The initial node has no parent; it enters the
 revision registry directly. Initialization does not count as runtime writes
 or eviction statistics. Root parameters come from the supplied set, and
 prediction marks are cleared because no engine precomputation accompanies it.
-Storage freshness remains required; historical state recovery is deferred.
+Storage freshness remains required for `New`. `Recover(config, storage, vc,
+policy)` reconstructs a saved set with its original height and policy state
+instead of treating its entries as a new batch (§12.6).
 
 ```rust
 pub trait Key:   Clone + Eq + Ord + AsRef<[u8]> + Borrow<[u8]> + Send + Sync + 'static {}
@@ -650,7 +658,7 @@ hinted) then `writes` of the union, against `writes` of the union on a copy
 that saw no hint: equal victims, equal digests, and the marks plus the last
 refinement leave storage holding exactly the victims, six blocks in a row
 so the kept marks of R31 carry over, both policies, default and early prediction thresholds
-(`hints_compose_to_the_plain_eviction` in `src/tests.rs`).
+(`hints_compose_to_the_plain_eviction` in `src/tests/`).
 
 ### 6.2 When and how much
 
@@ -845,10 +853,10 @@ initial set starts at height 1 with the same root as one initial batch and
 uses that root for revision lookup immediately. `Revision(EMPTY_ROOT)` resolves
 to the empty initial node only when one was supplied,
 while that node is in the K-ring (the adapter needs it only at genesis), and
-returns `RevisionNotFound` once it is retired. A node keeps its root
-only; the metadata hash is not stored, since a proof (§7.4, milestone 5)
-takes the metadata from the caller and recomputes the preimage with
-`Terms::combine`.
+returns `RevisionNotFound` once it is retired. A node keeps its root and
+metadata hash so checkpoint recovery can verify the preimage (§12.6).
+A proof (§7.4, milestone 5) still takes the metadata bytes from the caller
+and recomputes the preimage with `Terms::combine`.
 
 ### 7.4 Authenticated reads (milestone 5)
 
@@ -874,7 +882,8 @@ on one parent. Its contents: the **snapshot** (§4, the whole set after the
 batch), the **pinned storage view** (§5; the node's own storage proposal when
 it created one, §6.3, else the parent's, the same handle), the number of
 speculative steps that proposal chains on (§9.1; zero on the plain path, the
-one bit `Commit`'s poison rule needs, §9.2), its root (§7.3), and one
+one bit `Commit`'s poison rule needs, §9.2), its root and metadata hash (§7.3,
+§12.6), and one
 **weak link to its parent**. Statistics are counted at
 `Propose` (§9.5), so a node carries none.
 Nothing in a node changes after construction, so it is shared freely between
@@ -1317,7 +1326,7 @@ Milestone-2 tests (on `MemoryStorage`, which models firewood):
    firewood uses real hashing on large steps (10k entries or more) for its
    timing assertions.
 
-Status (milestone 2, 2026-10-29): tests 1–5 are in `src/tests.rs`
+Status (milestone 2, 2026-10-29): tests 1–5 are in `src/tests/`
 (`speculation_matches_the_plain_path` under both eviction rules, all
 schemes and policies: forty random blocks with deletes, overlapping and
 wrong hints, pauses for the worker, equal roots and storage roots at every
@@ -1666,7 +1675,7 @@ The
 engine contract tests (items 1–7, plus the failed-commit rule of §9.2: a
 handle whose commit failed reports that failure on every later operation)
 and the state-function check run against both backends
-(`src/storage/contract_tests.rs`), firewood in a temporary directory.
+(`src/tests/storage.rs`), firewood in a temporary directory.
 
 **Concurrency (R18, R19, R20).** Every lock is listed here with the reason
 it exists and its holds; the rule is that a reader takes none, and that the
@@ -1703,7 +1712,9 @@ an atomic load 0.4 ns, an `Arc` clone and drop 12 ns.
   the view (the link upgraded before the hold and released after it, so a
   parent whose last other reference went meanwhile is freed outside the
   lock) and one to install (ring push and retirement, live-index removal);
-  `Prefetch` one (resolve the node), `Close` none, and a reader's `Get`, `Root`, `Revision`, `LatestRevision` and `Stats` one each.
+  `Prefetch` one (resolve the node), `Close` one when checkpointing (clone the
+  committed head; none otherwise), and a reader's `Get`, `Root`, `Revision`,
+  `LatestRevision` and `Stats` one each.
   Never held across an engine call, a snapshot copy or a drop: retired ring
   entries are handed back and dropped after the hold, and the precomputation
   is retargeted by the writer with nothing held. About 15 ns uncontended plus the work: the parent check is
@@ -1895,14 +1906,61 @@ the paths in situ.
    (R33), and the engine window `K × rounds` grows with it (§8). The
    defaults stay provisional until the milestone-3 sweep confirms this on
    other block shapes.
-6. **Durability and bootstrap.** The set and policy state are consensus
-   state. A real write-ahead log of committed batches replayed into the set
-   (which is why the layer carries the name), or a replicated snapshot, is
-   needed before any validator may restart or state-sync. Bootstrap must
-   restore `height`, the capacity, the set and the policy state (which the
-   root checks through `policy_digest`, §7.3) so that `Root()`
-   after a reopen equals the last committed root (as `qmdb-ffi`'s reopen test
-   checks); until then `New` requires a fresh engine (§1).
+6. **Clean-shutdown persistence and recovery (R41).**
+   `Local::snapshot_path: Option<PathBuf>` selects a checkpoint file;
+   `None` retains in-memory operation and is the benchmark default.
+   `New(config, storage, snapshot)` still initializes fresh storage and refuses
+   an existing checkpoint file. `Recover(config, storage, vc, policy)` opens
+   the saved committed state after the caller reopens the matching engine
+   without truncation. It never silently falls back to empty initialization.
+
+   A checkpoint contains capacity, height, sorted keys and value/tombstone
+   records, policy consensus state, scheme/policy/engine identifiers and
+   parameter digests, storage root, combined root, and metadata hash. Nodes
+   now retain the metadata hash so recovery can recompute the exact root;
+   metadata bytes remain caller-owned. The policy's `encode_state(keys)` and
+   `restore_state(bytes, keys, height)` methods handle consensus state only.
+   Built-in policies encode one u64 write height per sorted snapshot key and
+   reconstruct their order/index arrays. They validate one height per key in
+   `[1, snapshot_height]`; hints, marks, and worker proposals are discarded.
+   Custom policies may opt in through those methods; enabling a snapshot path
+   for an unsupported policy fails at initialization.
+
+   File format v1 is `AWALSNAP`, u32 LE version, three length-prefixed IDs,
+   two 32-byte parameter digests, u64 LE capacity/height, three 32-byte hashes
+   (combined root, storage root, metadata), u64 LE entry count, entries,
+   policy-state bytes, and a BLAKE3 checksum of the preceding bytes. Byte
+   fields use u32 LE lengths. Each entry is a key followed by tag 0 for a
+   tombstone or tag 1 plus value bytes. The decoder bounds lengths/counts,
+   rejects malformed or unsorted/duplicate entries, and reconstructs keys
+   and values with `TryFrom<Vec<u8>>` (supported by all built-in byte types).
+   It rebuilds the commitment state for any scheme and verifies the combined
+   root, as well as checking the checksum, version, consensus parameters,
+   capacity, and current storage root. Local settings may change on recovery.
+
+   `Close` marks the writer closed and joins its worker as before. It clones
+   the committed head under one brief registry hold, then performs all
+   encoding and I/O outside that lock. It writes and syncs a temporary file
+   in the destination directory, closes/flushes the engine, atomically
+   replaces the checkpoint, and syncs the directory on Unix. Failed writes
+   or engine closes leave the preceding checkpoint intact. I/O and
+   `ActiveHandles` errors can be retried; a storage-close failure other than
+   `ActiveHandles` poisons checkpoint publication, including subsequent
+   attempts if the engine consumed its database before returning the error.
+   A poisoned writer can close storage but cannot publish a checkpoint.
+   A completed close is idempotent. Reads through existing handles retain
+   their existing behavior; drop all old Firewood handles/readers and the
+   writer before reopening its file in the same process.
+
+   Recovery installs only the latest committed node, with fresh counters and
+   a fresh worker. Historical revisions, uncommitted proposals, and predictions
+   are not restored. `MemoryStorage` remains an in-memory model: recovering
+   its set requires independently restoring matching engine state if any
+   entries had been evicted. This protocol guarantees recovery after a
+   successful close, not per-commit or crash durability. Storage and checkpoint
+   publication are not one atomic transaction; mismatched storage is rejected,
+   and matching roots alone cannot prove a checkpoint includes writes lost in
+   a crash. WAL/replay, rollback, and state-sync support remain future work.
 7. **Policy digest.** A term of its own again (R25, §7.3): `state_digest`,
    a full hash of the eviction order per proposal, chosen over an
    incremental accumulator because policy state will change often across
@@ -2259,6 +2317,13 @@ Milestone 4 adds `src/ffi/` (the C ABI, cbindgen → `auth_wal.h`, names
 `staticlib` crate type and the Go package `ffi` mirroring qmdb-ffi's files;
 the stubs that stood for them were removed in the review of 2026-11-02.
 
+Library tests are organized in `src/tests/`, with modules for policy rules,
+WAL behavior, speculation, injected faults, persistence, storage contracts,
+and consensus encodings. `common.rs` contains shared fixtures. The library
+loads them through its `#[cfg(test)] mod tests`; private implementation tests
+remain inline in their own modules. Test organization does not change the
+public API or expose internals solely for testing.
+
 Milestones
 
 0. **Done (2026-10-26).** Benchmark suite (§11) with the engine-only
@@ -2269,7 +2334,7 @@ Milestones
 1. **Done (2026-10-29).** Core library: snapshots and batch application
    (§4, §5), FIFO + LRU-write policies with their tests (§6.1), lthash and
    the `merkle` reference scheme, registry and handles, plain path only,
-   unit tests shared across policies and schemes (`src/tests.rs`: the §6.1
+   unit tests shared across policies and schemes (`src/tests/`: the §6.1
    list, the §8 lineage rules, the revision window, a differential test
    against a reference map, a firewood smoke test); the benchmark's
    auth_wal target (`WriteSet`). Reviewed on 2026-11-02 (§14).
@@ -3125,7 +3190,7 @@ rate limit before reporting, so R26–R28 stand unreviewed by the owner's
 call. Implemented: every `todo!()` but `speculate::build_step`; `New`
 refuses `speculate = true` (`InvalidConfig`) until milestone 2; the sparse
 Merkle reference scheme (depth 256, a defaults table, positions by level and
-prefix); 23 tests in `src/tests.rs` (both policies' semantics and digests,
+prefix); 23 tests in `src/tests/` (both policies' semantics and digests,
 the then-shared `Marks::reconcile`, the plain-path suite for every scheme × policy on
 `MemoryStorage`: fresh instance, reads and roots, evictions reaching
 storage, the revision window, the §8 lineage rules, metadata and the
@@ -3984,3 +4049,21 @@ The [full upstream report](../benchmark/results/2026-11-03-latest-firewood/READM
 includes all seeds, commands, ranges, raw measurements, phase timings, memory
 samples, and an archive of the tested sources. Seven focused tests passed in
 each hash mode; Clippy, formatting, and artifact verification also passed.
+
+### Clean-shutdown checkpoint recovery
+
+R41 adds an optional snapshot file on `Close` and an explicit `Recover`
+constructor (§12.6). Existing new/seeded initialization remains available.
+The checkpoint contains the latest committed set and policy state; commitment
+state is rebuilt and the saved combined root verified before exposing it.
+Only the metadata hash is added to live nodes, leaving commitment encodings
+and the proposal/commit protocol unchanged.
+
+Eight focused persistence tests cover both policies and all three schemes,
+identical future roots against uninterrupted execution, genesis and populated
+sets, metadata, empty values and tombstones, fixed-size byte types, malformed
+files, configuration/storage mismatches, and close retries and flush failures.
+Firewood round trips pass with both MerkleDB and Ethereum hashing, including
+two successive restarts and reads of evicted values. Existing close regressions
+also pass. Clippy, formatting, and a build without Firewood were checked;
+the full unit suite and performance experiments were not rerun.

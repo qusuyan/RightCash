@@ -183,8 +183,66 @@ The resulting set exposes no independent policy mutation.
 A populated initial set is equivalent to one initial batch: height 1 and a
 content-dependent root, with all initial entries retained in memory. An empty
 set remains height 0 with `EMPTY_ROOT`. Initial entries do not count as runtime
-writes in statistics. This supports initialization, not recovery of a prior
-database or historical policy ordering.
+writes in statistics. Use `AuthWal::recover` to restore a prior database and
+its historical policy ordering.
+
+## Clean-shutdown persistence and recovery
+
+Set `config.local.snapshot_path = Some(path)` to enable a checkpoint on
+`AuthWal::close()`. The file contains the **latest committed** set, including
+tombstones, policy ages, height, capacity, metadata hash, and the corresponding
+storage and combined roots. FIFO, LRU-write, and all three commitment schemes
+support recovery. Checkpointing is disabled by default; the benchmarks retain
+their existing behavior.
+
+On startup, reopen Firewood without truncation and call
+`AuthWal::recover(config, storage, vc, policy)`. Supply matching consensus
+parameters; local settings such as the high watermark and speculation settings
+may change. For example, with the `firewood` feature:
+
+```rust
+use auth_wal::{AuthWal, Config, Consensus, Local};
+use auth_wal::policy::LruWrite;
+use auth_wal::set::Snapshot;
+use auth_wal::storage::{FirewoodConfig, FirewoodStorage};
+use auth_wal::vc::rehash::Rehash;
+
+let snapshot_path = std::path::PathBuf::from("data/auth-wal.snapshot");
+let config = Config {
+    consensus: Consensus { capacity: 10_000 },
+    local: Local { snapshot_path: Some(snapshot_path.clone()), ..Local::default() },
+};
+std::fs::create_dir_all("data")?;
+let engine = FirewoodStorage::new(FirewoodConfig::new("data/firewood"))?;
+let policy = LruWrite::new(7_000).with_trigger(9_000);
+let mut wal: AuthWal<Vec<u8>, Vec<u8>, _, _, _> = if snapshot_path.try_exists()? {
+    AuthWal::recover(config, engine, Rehash, policy)?
+} else {
+    AuthWal::new(config, engine, Snapshot::empty(Rehash, policy, 10_000)?)?
+};
+// Propose and commit blocks normally.
+wal.close()?;
+drop(wal);
+```
+
+Close joins the worker, writes and syncs a temporary snapshot file, closes and
+flushes storage, then atomically replaces the snapshot and syncs its directory
+on Unix. I/O and outstanding-proposal errors are reported and may be retried;
+a failed storage flush prevents publication. `new` refuses an existing snapshot
+file. Recovery checks the file version, checksum, key/value decoding, policy
+state, configuration, storage root, and reconstructed combined root.
+
+Only the latest committed revision is recovered. Uncommitted proposals,
+speculative marks, retained revision history, and counters are not saved.
+Drop the old writer and all its handles/readers before reopening Firewood in
+the same process, since pinned views can keep its file lock alive.
+`MemoryStorage` does not persist evicted data; a set checkpoint alone cannot
+restore a nonempty memory engine.
+
+This supports recovery after a **successful close**. Commit and dropping the
+writer do not checkpoint the set. Crash recovery, rollback to an older storage
+revision, and state sync remain future work; a checkpoint/storage-root mismatch
+is an error, never an implicit reset.
 
 ## Benchmarks
 
@@ -216,7 +274,21 @@ runs through auth_wal. `--help` lists every knob (capacity, policy, scheme,
 speculation rounds/margin, hints and hint noise, synthetic storage latency,
 seed, the per-phase breakdown).
 
+## Tests and checks
+
+Library tests are grouped under [`src/tests/`](src/tests/mod.rs): `wal`,
+`policy`, `speculation`, `faults`, `persist`, `storage`, and `encodings`.
+Shared fixtures live in `src/tests/common.rs`. These are unit tests because
+they also inspect crate-private snapshots, storage views, and worker state;
+tests of private implementation helpers stay inline beside those helpers.
+
 ```bash
+# Compile all library tests, without running the suite.
+cargo test -p auth_wal --lib --no-default-features --no-run
+cargo test -p auth_wal --lib --all-features --no-run
+# Run just persistence/recovery tests, including the private file-write test.
+cargo test -p auth_wal --lib --features firewood checkpoint_
+
 cargo check --workspace --all-features            # lib + benchmark
 cargo check -p auth_wal --features firewood        # firewood backend (path dependency on ../firewood); -p: the benchmark enables it
 cargo test  --workspace --all-features             # the whole battery (firewood contract and smoke tests included)

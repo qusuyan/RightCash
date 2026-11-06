@@ -12,8 +12,6 @@
 
 pub mod memory;
 
-#[cfg(test)]
-mod contract_tests;
 #[cfg(feature = "firewood")]
 pub mod firewood;
 
@@ -173,7 +171,9 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
     /// engine (R19), so an adapter keeps its database in a plain field and
     /// needs no lock to take it out. `ActiveHandles` while a live proposal
     /// handle is alive (item 6; both v0 adapters count them); idempotent. The
-    /// default is a no-op for an engine with nothing to release.
+    /// A successful close must make accepted commits durable for a persistent
+    /// engine: auth_wal publishes its checkpoint only after this returns Ok.
+    /// The default is a no-op for an engine with nothing to release.
     fn close(&mut self) -> Result<()> {
         Ok(())
     }

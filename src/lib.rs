@@ -15,6 +15,7 @@
 //! | [`proposal`]  | §8     | immutable nodes, the handle, the registry |
 //! | [`speculate`] | §9     | the worker: a channel of requests, the thread that builds steps, `submit`/`finish`/`block_end`/`reset` |
 //! | [`timings`]   | §9.5, §11 | per-call phase timings of `propose` and `commit`, read by the benchmark's `--breakdown` |
+//! | `persist`     | §12.6 | clean-shutdown checkpoint encoding, validation, and atomic publication |
 //!
 //! Threading (design §3, R19): [`AuthWal`] is the **writer**; every operation
 //! that changes state takes `&mut self`, so the type system serialises them.
@@ -24,6 +25,7 @@
 //! (design §10 lists every hold).
 
 pub mod lattice;
+mod persist;
 pub mod policy;
 pub mod proposal;
 pub mod root;
@@ -37,6 +39,7 @@ pub mod vc;
 #[cfg(test)]
 mod tests;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -65,6 +68,10 @@ pub struct Consensus {
 /// Local parameters: may differ between validators and never reach a root.
 #[derive(Clone, Debug)]
 pub struct Local {
+    /// Clean-shutdown checkpoint file. `close` saves the latest committed
+    /// snapshot here; `AuthWal::recover` reads it with matching storage.
+    /// None disables checkpointing (the default for in-memory/benchmark use).
+    pub snapshot_path: Option<PathBuf>,
     /// Committed revisions kept for `revision()` (design §8); at least 2
     /// (`Config::validate`).
     pub revisions: usize,
@@ -88,6 +95,7 @@ impl Default for Local {
     fn default() -> Self {
         // Rounds remain provisional; min_step follows the focused Zipf comparison (design §9.2, §14).
         Self {
+            snapshot_path: None,
             revisions: 128,
             speculate: false,
             speculation_rounds: 3,
@@ -128,6 +136,11 @@ impl Config {
     /// validate the supplied snapshot, policy, or storage engine; `new` does
     /// those checks separately.
     pub fn validate(&self) -> Result<()> {
+        if let Some(path) = &self.local.snapshot_path
+            && path.file_name().is_none()
+        {
+            return Err(Error::InvalidConfig("snapshot_path must name a file".into()));
+        }
         if self.consensus.capacity == 0 {
             return Err(Error::InvalidConfig("capacity must be at least 1".into()));
         }
@@ -366,13 +379,16 @@ where
     /// The root preimage's static terms (design §7.3), computed at `new`
     /// from the scheme, the policy and the engine.
     terms: root::Terms,
-    /// Set by a failed mid-chain engine commit (design §9.2); `propose` and
-    /// `commit` return `Error::Poisoned` from then on.
+    /// Set by a failed mid-chain engine commit (design §9.2), or a failed
+    /// storage flush during checkpointing. Prevents further writes and
+    /// publication of a checkpoint whose storage durability is uncertain.
     poisoned: Option<String>,
     /// Set by `close`: the writer's operations report `Closed` from then on
     /// and hints are no-ops; reads never check it (R20). The worker needs
     /// no flag: dropping its channel's sender ends it (design §9.2).
     closed: bool,
+    /// Engine closure and optional checkpoint publication both succeeded.
+    close_complete: bool,
     /// Where the last `propose` and the last successful `commit` spent their
     /// time (design §9.5): read by `last_propose_timings` and
     /// `last_commit_timings`.
@@ -392,19 +408,68 @@ where
     /// The set owns its entries, policy, commitment scheme and capacity;
     /// its capacity must match `config.consensus.capacity`. A populated set
     /// starts at its own height and authenticated root; an empty height-zero
-    /// set retains `EMPTY_ROOT`. This is initialization, not database recovery.
+    /// set retains `EMPTY_ROOT`. Use `recover` to reopen an existing checkpoint.
     /// Validates configuration, set policy, engine freshness and revision
     /// window. The target starts dead, with no speculative proposals.
     pub fn new(config: Config, storage: S, snapshot: Snapshot<K, V, C, P>) -> Result<Self> {
+        if storage.root() != EMPTY_ROOT {
+            return Err(Error::EngineNotFresh);
+        }
+        if let Some(path) = &config.local.snapshot_path {
+            if path.try_exists()? {
+                return Err(Error::InvalidConfig(
+                    "snapshot file already exists; use recover or a new path".into(),
+                ));
+            }
+            // Refuse unsupported policies at startup, not at shutdown.
+            snapshot.encode_policy()?;
+        }
+        Self::from_snapshot(config, storage, snapshot, root::metadata_hash(None))
+    }
+
+    /// Recover the latest committed state from `config.local.snapshot_path`.
+    /// Reopen the matching persistent engine first, without truncating it.
+    /// Consensus capacity, scheme, policy parameters, and storage root must
+    /// match the checkpoint; local settings may change. Only the latest
+    /// revision is restored. Counters, hints, and worker proposals start fresh.
+    ///
+    /// All built-in byte containers support the decoding bounds below;
+    /// fixed-size keys/values reject incorrect lengths without panicking.
+    /// Missing/corrupt files return an error, never silently create an empty DB.
+    pub fn recover(config: Config, storage: S, vc: C, policy: P) -> Result<Self>
+    where
+        K: TryFrom<Vec<u8>>,
+        V: TryFrom<Vec<u8>>,
+    {
+        config.validate()?;
+        let path = config
+            .local
+            .snapshot_path
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfig("recover requires snapshot_path".into()))?;
+        let (snapshot, metadata_hash) = persist::load(
+            path,
+            vc,
+            policy,
+            config.consensus.capacity,
+            S::ENGINE_ID,
+            storage.root(),
+        )?;
+        Self::from_snapshot(config, storage, snapshot, metadata_hash)
+    }
+
+    fn from_snapshot(
+        config: Config,
+        storage: S,
+        snapshot: Snapshot<K, V, C, P>,
+        metadata_hash: types::Digest,
+    ) -> Result<Self> {
         config.validate()?;
         snapshot.validate(config.consensus.capacity)?;
         if config.local.speculate && !S::ROOT_IS_STATE_FUNCTION {
             return Err(Error::InvalidConfig(
                 "speculative eviction requires an engine whose root is a function of state (design §9.3)".into(),
             ));
-        }
-        if storage.root() != EMPTY_ROOT {
-            return Err(Error::EngineNotFresh);
         }
         let window = config.local.engine_window(S::COMMITS_CHAIN_LINKS_SEPARATELY);
         if storage.revisions() < window {
@@ -423,9 +488,9 @@ where
             snapshot.commitment(),
             snapshot.policy_digest(),
             head.root(),
-            root::metadata_hash(None),
+            metadata_hash,
         );
-        let genesis = Node::new(snapshot, Weak::new(), head.clone(), 0, initial_root);
+        let genesis = Node::new(snapshot, Weak::new(), head.clone(), 0, initial_root, metadata_hash);
         // The worker starts on this node's view, so its first submissions need
         // no reset. Plain instances have no speculation target.
         let target = if config.local.speculate {
@@ -460,6 +525,7 @@ where
             terms,
             poisoned: None,
             closed: false,
+            close_complete: false,
             last_propose: ProposeTimings::default(),
             last_commit: CommitTimings::default(),
         })
@@ -593,15 +659,16 @@ where
         };
 
         let mark = Instant::now();
+        let metadata_hash = root::metadata_hash(metadata);
         let root = self.terms.combine(
             snapshot.capacity(),
             snapshot.height(),
             snapshot.commitment(),
             snapshot.policy_digest(),
             view.root(),
-            root::metadata_hash(metadata),
+            metadata_hash,
         );
-        let node = Node::new(snapshot, Arc::downgrade(&parent), view, steps, root);
+        let node = Node::new(snapshot, Arc::downgrade(&parent), view, steps, root, metadata_hash);
         if keep_chain {
             self.target = Arc::downgrade(&node);
         } else if speculative {
@@ -806,15 +873,53 @@ where
     /// closed and hints remain no-ops; drop outstanding proposals and retry `close`.
     /// `prune` is a direct engine hook and does not check this flag.
     ///
+    /// With `Local::snapshot_path`, sync a temporary file containing the latest
+    /// committed snapshot, close/flush storage, then atomically publish the file.
+    /// I/O and active-handle errors can be retried. A storage-close error other
+    /// than `ActiveHandles` poisons the writer and prevents checkpoint publication.
+    /// A poisoned writer may close storage but cannot save a recoverable snapshot.
+    /// Dropping an instance without `close` does not save a snapshot.
+    ///
     /// Retained handles and readers can still read available revisions. Committed
     /// storage handles do not prevent closure. Repeated calls are allowed, including
     /// on a poisoned writer.
     pub fn close(&mut self) -> Result<()> {
+        if self.close_complete {
+            return Ok(());
+        }
         self.closed = true;
         if let Some(mut worker) = self.worker.take() {
             worker.shutdown();
         }
-        self.storage.close()
+        if let Some(path) = self.config.local.snapshot_path.clone() {
+            if let Some(reason) = &self.poisoned {
+                self.storage.close()?;
+                return Err(Error::Poisoned(reason.clone()));
+            }
+            let head = self.reader.shared.registry.lock().head().clone();
+            let bytes = persist::encode(
+                head.snapshot(),
+                S::ENGINE_ID,
+                head.root(),
+                head.storage_view().root(),
+                head.metadata_hash(),
+            )?;
+            persist::write(&path, &bytes, || {
+                let result = self.storage.close();
+                if let Err(error) = &result
+                    && !matches!(error, Error::ActiveHandles)
+                {
+                    // Some engines consume their database even when flushing
+                    // fails. A subsequent no-op close must not publish a file.
+                    self.poisoned = Some(format!("storage close failed: {error}"));
+                }
+                result
+            })?;
+        } else {
+            self.storage.close()?;
+        }
+        self.close_complete = true;
+        Ok(())
     }
 
     /// Whether `node` is the precomputation's target (pointer identity on the

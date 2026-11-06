@@ -646,7 +646,7 @@ Clarification 30 (2026-10-29), same message:
 > `hinted_writes` + a final `writes` is the same as the evicted keys you
 > get if you directly give the final unioned keys through `writes`.
 
-(Done, R32: `src/tests.rs` `hints_compose_to_the_plain_eviction`, for both
+(Done, R32: `src/tests/` `hints_compose_to_the_plain_eviction`, for both
 policies under both eviction rules, forty random configurations, six
 blocks each with one to six overlapping hints (keys hinted but not written,
 writes never hinted): the actual eviction and the state digest equal the
@@ -852,6 +852,18 @@ An empty set retains height-zero genesis; a populated set is equivalent to
 one initial batch at height 1 over fresh storage, with a content-dependent
 root. This does not implement recovery of an existing database.
 
+Clarification 38, on persistence and recovery:
+
+> Let's add basic persist and recover. On `close`, please write the latest
+> snapshot to disk; and on start up, you should be able to recover the
+> snapshot from the on-disk snapshot.
+
+R41 extends R10 with a checkpoint of the latest committed state on clean
+shutdown, and startup recovery of that checkpoint with matching storage.
+The set, tombstones, eviction-policy state, height, and authenticated root
+must survive. See 01 §12.6 for the file format, validation, and the boundary
+between clean-shutdown recovery and future crash durability.
+
 ## Requirements checklist (extracted)
 
 | # | Requirement | Design section |
@@ -865,7 +877,7 @@ root. This does not implement recovery of an existing database.
 | R7 | Writes revertible for a short period: copy-on-write sets; free old sets after later commits | 01 §4, §8 |
 | R8 | Evicted writes go to storage as a **proposal** that commits when the set commits | 01 §6.3, §8 |
 | R9 | Policy exposes **likely-next victims**; mechanism sends them to storage early as speculative proposals, refined during block execution, with mispredictions reverted so the final storage state equals a plain eviction | 01 §9 |
-| R10 | Everything in memory for now | 01 §2, §10 |
+| R10 | Live state in memory; R41 adds clean-shutdown checkpoints | 01 §2, §10, §12.6 |
 | R11 | Simple benchmarks modelled on `firewood/benchmark` | 01 §11 |
 | R12 | A proposal returns **one** commitment: the set commitment combined with the storage layer's commitment | 01 §7.3 |
 | R13 | **Firewood** is the storage backend of record; QMDB keeps interface-level support only | 01 §1, §10 |
@@ -896,3 +908,4 @@ root. This does not implement recovery of an existing database.
 | R38 | **Review rounds until clean.** Independent reviews of two kinds, simplification (designs that could be simpler, leftovers of experiments never reverted) and general correctness, repeated until the reviewers have no further comments; every finding applied, or recorded with the reason (a requirement it would contradict, or the owner's call) | 01 §14 "Review of 2026-11-02", `docs/TODO.md` |
 | R39 | **High watermark starts precomputation only.** Predict a capacity-to-low batch at the high watermark, refine it with hints, retain immutable proposals across non-evicting blocks, and evict only above capacity. High watermark is local and excluded from roots; low watermark remains consensus. | 01 §6.1, §6.2, §9.1 |
 | R40 | **Construct from the complete set.** `AuthWal::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement. | 01 §3, §4, §7.3 |
+| R41 | **Clean-shutdown persistence and recovery.** Save the latest committed snapshot on close and recover it at startup with matching storage, preserving policy order and the combined root. | 01 §3, §12.6 |
