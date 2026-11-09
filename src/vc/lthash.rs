@@ -10,48 +10,46 @@ use crate::vc::{VectorCommitment, item_fields};
 
 const TAG: &str = "auth_wal/lthash";
 
-/// Parameter-free scheme.
-#[derive(Clone, Default)]
-pub struct LtHash;
-
+/// Parameter-free scheme; the state is the accumulator of the set's items.
 #[derive(Clone)]
-pub struct LtHashState {
+pub struct LtHash {
     acc: LatticeAccumulator,
 }
 
 impl LtHash {
+    /// The scheme over no entries.
     pub fn new() -> Self {
-        Self
+        Self {
+            acc: LatticeAccumulator::new(TAG),
+        }
+    }
+}
+
+impl Default for LtHash {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl<K: Key> VectorCommitment<K> for LtHash {
-    type State = LtHashState;
-
     fn scheme_id(&self) -> &'static str {
         "lthash"
     }
 
-    fn empty(&self) -> Self::State {
-        LtHashState {
-            acc: LatticeAccumulator::new(TAG),
-        }
+    fn empty(&self) -> Self {
+        Self::new()
     }
 
-    fn apply(&self, state: &mut Self::State, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>) {
+    fn apply(&mut self, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>) {
         if let Some(entry) = old {
-            state.acc.remove_fields(&item_fields(key, entry));
+            self.acc.remove_fields(&item_fields(key, entry));
         }
         if let Some(entry) = new {
-            state.acc.add_fields(&item_fields(key, entry));
+            self.acc.add_fields(&item_fields(key, entry));
         }
     }
 
-    fn commitment<'a>(
-        &self,
-        state: &Self::State,
-        _entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>,
-    ) -> Digest {
-        state.acc.digest()
+    fn commitment<'a>(&mut self, _entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest {
+        self.acc.digest()
     }
 }

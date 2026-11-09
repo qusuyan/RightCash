@@ -198,10 +198,11 @@ where
     /// `policy.state_digest()` as of this node, a root preimage term (design
     /// §7.3), computed once when the snapshot is built.
     policy_digest: Digest,
-    /// Scheme instance (parameters) and the incremental commitment of `entries`.
+    /// Scheme instance: its parameters and its state for `entries` (an
+    /// incremental commitment, or what a whole-set scheme keeps: the
+    /// `merkle-blake3` tree, freed with this snapshot).
     vc: C,
-    commitment: C::State,
-    /// `vc.commitment(&commitment, entries)` as of this node, a root
+    /// `vc.commitment(entries)` as of this node, a root
     /// preimage term (design §7.3), computed once when the snapshot is
     /// built: the lattice's digest of its lanes, or a whole-set scheme's
     /// hash over every entry (design §7.2).
@@ -290,8 +291,8 @@ where
     pub(crate) fn genesis(vc: C, policy: P, capacity: usize) -> Self {
         let entries: Vec<Record<K>> = Vec::new();
         let arena = Arena::empty();
-        let commitment = vc.empty();
-        let commitment_digest = vc.commitment(&commitment, entry_refs(&entries, &arena));
+        let mut vc = vc.empty();
+        let commitment_digest = vc.commitment(entry_refs(&entries, &arena));
         let policy_digest = policy.state_digest();
         Self {
             entries,
@@ -299,7 +300,6 @@ where
             policy: Mutex::new(policy),
             policy_digest,
             vc,
-            commitment,
             commitment_digest,
             height: 0,
             capacity,
@@ -399,16 +399,15 @@ where
             .collect();
         let mut arena = Arena::empty();
         let (_, ops, mut summary) = normalise(batch, &mut arena);
-        let mut commitment = vc.empty();
-        let (entries, _) = merge::<K, V, C>(&[], &ops, &[], &mut arena, &vc, &mut commitment, &mut summary);
-        let commitment_digest = vc.commitment(&commitment, entry_refs(&entries, &arena));
+        let mut vc = vc.empty();
+        let (entries, _) = merge::<K, V, C>(&[], &ops, &[], &mut arena, &mut vc, &mut summary);
+        let commitment_digest = vc.commitment(entry_refs(&entries, &arena));
         Ok(Self {
             entries,
             arena,
             policy: Mutex::new(policy),
             policy_digest,
             vc,
-            commitment,
             commitment_digest,
             height,
             capacity,
@@ -464,7 +463,7 @@ where
     /// evicted final entries sorted by key, the policy's prediction refinement,
     /// operation counts, and phase timings. The parent is left unchanged.
     ///
-    /// Clones the arena's chunk pointers, policy, and commitment; normalises
+    /// Clones the arena's chunk pointers, policy, and scheme instance; normalises
     /// the batch; asks the cloned policy for victims; and builds the child's
     /// records with `merge`. Compacts the child's arena if needed, then computes
     /// its digests. Panics if the policy returns invalid victims or leaves the
@@ -474,8 +473,7 @@ where
         let mark = Instant::now();
         let mut arena = self.arena.clone();
         let mut policy = self.policy.lock().clone();
-        let vc = self.vc.clone();
-        let mut commitment = self.commitment.clone();
+        let mut vc = self.vc.clone();
         timings.copy = mark.elapsed();
 
         let mark = Instant::now();
@@ -494,8 +492,7 @@ where
             &ops,
             &eviction.all_evicted_keys,
             &mut arena,
-            &vc,
-            &mut commitment,
+            &mut vc,
             &mut summary,
         );
         assert!(
@@ -512,7 +509,7 @@ where
         let policy_digest = policy.state_digest();
         timings.digest = mark.elapsed();
         let mark = Instant::now();
-        let commitment_digest = vc.commitment(&commitment, entry_refs(&entries, &arena));
+        let commitment_digest = vc.commitment(entry_refs(&entries, &arena));
         timings.commitment = mark.elapsed();
         Applied {
             snapshot: Snapshot {
@@ -521,7 +518,6 @@ where
                 policy: Mutex::new(policy),
                 policy_digest,
                 vc,
-                commitment,
                 commitment_digest,
                 height,
                 capacity,
@@ -631,8 +627,8 @@ fn normalise<K: Key, V: Value>(batch: Vec<BatchOp<K, V>>, arena: &mut Arena) -> 
 ///   `parent` or `ops`; otherwise this function panics.
 /// - `arena`: the child's arena after `normalise`. It must resolve all slots
 ///   in `parent` and `ops`, with `live` still equal to the parent's live bytes.
-/// - `vc`: the commitment scheme used by the parent and child.
-/// - `commitment`: a mutable clone of the parent's commitment state.
+/// - `vc`: a clone of the parent's commitment scheme instance, which becomes
+///   the child's.
 /// - `summary`: the counts returned by `normalise`.
 ///
 /// Returns `(entries, evicted)`, both sorted by distinct key. `entries` holds
@@ -640,7 +636,7 @@ fn normalise<K: Key, V: Value>(batch: Vec<BatchOp<K, V>>, arena: &mut Arena) -> 
 /// owned final entries for storage: a batch operation overrides the parent
 /// even when that key is evicted. The input slices remain unchanged.
 ///
-/// Updates `arena.live` and `commitment` to describe only retained records,
+/// Updates `arena.live` and `vc` to describe only retained records,
 /// and adds initial puts to parent-present keys to `summary.in_place_updates`.
 /// A key inserted and evicted in this batch never enters the commitment.
 /// Does not compact the arena or enforce the capacity limit; `apply` does.
@@ -649,8 +645,7 @@ fn merge<K, V, C>(
     ops: &[Op<K>],
     victims: &[K],
     arena: &mut Arena,
-    vc: &C,
-    commitment: &mut C::State,
+    vc: &mut C,
     summary: &mut AppliedSummary,
 ) -> (Vec<Record<K>>, Entries<K, V>)
 where
@@ -691,7 +686,7 @@ where
         if victim_index < victims.len() && victims[victim_index] == *key {
             victim_index += 1;
             if let Some(parent_slot) = parent_slot {
-                vc.apply(commitment, key, Some(arena.entry(parent_slot)), None);
+                vc.apply(key, Some(arena.entry(parent_slot)), None);
                 arena.live -= Arena::len(parent_slot);
             }
             let final_slot = batch_slot
@@ -703,17 +698,12 @@ where
         // Retain the batch result if supplied, otherwise retain the parent slot.
         let slot = match (parent_slot, batch_slot) {
             (Some(parent_slot), Some(batch_slot)) => {
-                vc.apply(
-                    commitment,
-                    key,
-                    Some(arena.entry(parent_slot)),
-                    Some(arena.entry(batch_slot)),
-                );
+                vc.apply(key, Some(arena.entry(parent_slot)), Some(arena.entry(batch_slot)));
                 arena.live = arena.live + Arena::len(batch_slot) - Arena::len(parent_slot);
                 batch_slot
             }
             (None, Some(batch_slot)) => {
-                vc.apply(commitment, key, None, Some(arena.entry(batch_slot)));
+                vc.apply(key, None, Some(arena.entry(batch_slot)));
                 arena.live += Arena::len(batch_slot);
                 batch_slot
             }
@@ -772,6 +762,7 @@ mod tests {
     use crate::tests::common::Rng;
     use crate::vc::lthash::LtHash;
     use crate::vc::merkle::Merkle;
+    use crate::vc::merkle_blake3::MerkleBlake3;
     use crate::vc::rehash::Rehash;
 
     type K = Vec<u8>;
@@ -782,17 +773,26 @@ mod tests {
         C: VectorCommitment<K>,
         P: EvictionPolicy<K>,
     {
-        let mut state = vc.empty();
+        let mut fresh = vc.empty();
         for (key, entry) in entry_refs(&snapshot.entries, &snapshot.arena) {
-            vc.apply(&mut state, key, None, Some(entry));
+            fresh.apply(key, None, Some(entry));
         }
-        vc.commitment(&state, entry_refs(&snapshot.entries, &snapshot.arena))
+        fresh.commitment(entry_refs(&snapshot.entries, &snapshot.arena))
     }
 
     /// Random blocks (deletes, empty values, repeated keys, evictions,
     /// compactions) against the oracle, the key order and the arena's live
     /// count.
     fn incremental_matches_fresh<C, P>(vc: C, policy: P, seed: u64)
+    where
+        C: VectorCommitment<K>,
+        P: EvictionPolicy<K>,
+    {
+        incremental_matches_fresh_and(vc, policy, seed, |_| {});
+    }
+
+    /// `incremental_matches_fresh`, also running `check` on every snapshot.
+    fn incremental_matches_fresh_and<C, P>(vc: C, policy: P, seed: u64, check: impl Fn(&Snapshot<K, V, C, P>))
     where
         C: VectorCommitment<K>,
         P: EvictionPolicy<K>,
@@ -827,6 +827,7 @@ mod tests {
             let live: usize = snapshot.entries.iter().map(|r| Arena::len(r.slot)).sum();
             assert_eq!(snapshot.arena.live, live, "block {block}: arena.live drifted");
             assert_eq!(snapshot.commitment(), fresh_digest(&vc, &snapshot), "block {block}");
+            check(&snapshot);
         }
         assert!(evicted > 0);
     }
@@ -852,6 +853,48 @@ mod tests {
     #[test]
     fn rehash_matches_fresh() {
         incremental_matches_fresh(Rehash::new(), LruWrite::<K>::new(8), 3);
+    }
+
+    /// A snapshot's tree lives exactly as long as the snapshot: the child
+    /// builds its own, and dropping the parent frees the parent's.
+    #[test]
+    fn merkle_blake3_tree_is_freed_with_its_snapshot() {
+        let put = |key: &str| BatchOp::Put {
+            key: key.as_bytes().to_vec(),
+            value: b"1".to_vec(),
+        };
+        let genesis = Snapshot::<K, V, MerkleBlake3<K>, Fifo<K>>::empty(MerkleBlake3::new(2), Fifo::new(4), 8).unwrap();
+        let parent = genesis.apply(vec![put("a"), put("b"), put("c")]).snapshot;
+        let parent_tree = Arc::downgrade(parent.vc.tree_handle().unwrap());
+        let child = parent.apply(vec![put("d")]).snapshot;
+        let child_tree = child.vc.tree_handle().unwrap();
+        assert_eq!((parent_tree.upgrade().unwrap().len(), child_tree.len()), (3, 4));
+        assert!(!Arc::ptr_eq(&parent_tree.upgrade().unwrap(), child_tree));
+        drop(parent);
+        assert!(
+            parent_tree.upgrade().is_none(),
+            "the parent's tree outlived its snapshot"
+        );
+        assert_eq!(child.vc.tree().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn merkle_blake3_matches_fresh() {
+        // The digest alone would only show the build is deterministic: also
+        // check that the tree each snapshot keeps is the tree a fresh build
+        // over its entries gives.
+        fn kept_tree_is_fresh<P: EvictionPolicy<K>>(snapshot: &Snapshot<K, V, MerkleBlake3<K>, P>) {
+            let mut fresh = snapshot.vc.empty();
+            fresh.commitment(entry_refs(&snapshot.entries, &snapshot.arena));
+            let kept = snapshot.vc.tree().expect("every snapshot keeps its tree");
+            assert_eq!(kept.len(), snapshot.entries.len());
+            assert_eq!(Some(kept), fresh.tree());
+        }
+        for (seed, branching) in [(1, 2), (2, 3), (3, 16)] {
+            let vc = MerkleBlake3::new(branching);
+            incremental_matches_fresh_and(vc.clone(), LruWrite::<K>::new(8), seed, kept_tree_is_fresh);
+            incremental_matches_fresh_and(vc, Fifo::<K>::new(14).with_trigger(14), seed, kept_tree_is_fresh);
+        }
     }
 
     /// A policy that names whatever victims it is told to.

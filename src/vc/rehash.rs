@@ -29,23 +29,19 @@ impl Rehash {
 }
 
 impl<K: Key> VectorCommitment<K> for Rehash {
-    type State = ();
-
     fn scheme_id(&self) -> &'static str {
         "rehash"
     }
 
-    fn empty(&self) -> Self::State {}
+    fn empty(&self) -> Self {
+        Self
+    }
 
     /// Intentionally ignore individual transitions: `commitment` receives
     /// the complete final set, so this scheme has no incremental state to update.
-    fn apply(&self, _state: &mut Self::State, _key: &K, _old: Option<EntryRef<'_>>, _new: Option<EntryRef<'_>>) {}
+    fn apply(&mut self, _key: &K, _old: Option<EntryRef<'_>>, _new: Option<EntryRef<'_>>) {}
 
-    fn commitment<'a>(
-        &self,
-        _state: &Self::State,
-        entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>,
-    ) -> Digest {
+    fn commitment<'a>(&mut self, entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest {
         let count = entries.len();
         // Serialize the iterator's order as supplied. The snapshot guarantees
         // distinct ascending keys; this scheme does not canonicalize them here.
@@ -76,7 +72,7 @@ mod tests {
     type V = Vec<u8>;
 
     fn digest(entries: &BTreeMap<K, Entry<V>>) -> Digest {
-        VectorCommitment::<K>::commitment(&Rehash, &(), entries.iter().map(|(k, e)| (k, e.as_ref())))
+        VectorCommitment::<K>::commitment(&mut Rehash, entries.iter().map(|(k, e)| (k, e.as_ref())))
     }
 
     #[test]

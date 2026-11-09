@@ -8,7 +8,7 @@ use crate::storage::{MemoryConfig, MemoryStorage, StorageEngine, StorageProposal
 use crate::types::BatchOp;
 use crate::types::{EMPTY_ROOT, Error, Hash, Result};
 use crate::vc::VectorCommitment;
-use crate::vc::{lthash::LtHash, merkle::Merkle, rehash::Rehash};
+use crate::vc::{lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 use crate::{AuthWal, Config, Consensus, Local};
 use std::fs;
 use std::path::Path;
@@ -117,10 +117,12 @@ fn roundtrip<C: VectorCommitment<Vec<u8>>, P: EvictionPolicy<Vec<u8>>>(vc: C, po
 fn checkpoint_recovery_preserves_future_roots_for_all_schemes_and_policies() {
     roundtrip(Rehash, Fifo::new(3).with_trigger(4));
     roundtrip(Rehash, LruWrite::new(3).with_trigger(4));
-    roundtrip(Merkle, Fifo::new(3).with_trigger(4));
-    roundtrip(Merkle, LruWrite::new(3).with_trigger(4));
-    roundtrip(LtHash, Fifo::new(3).with_trigger(4));
-    roundtrip(LtHash, LruWrite::new(3).with_trigger(4));
+    roundtrip(Merkle::new(), Fifo::new(3).with_trigger(4));
+    roundtrip(Merkle::new(), LruWrite::new(3).with_trigger(4));
+    roundtrip(LtHash::new(), Fifo::new(3).with_trigger(4));
+    roundtrip(LtHash::new(), LruWrite::new(3).with_trigger(4));
+    roundtrip(MerkleBlake3::new(2), Fifo::new(3).with_trigger(4));
+    roundtrip(MerkleBlake3::new(3), LruWrite::new(3).with_trigger(4));
 }
 
 #[test]
@@ -229,7 +231,7 @@ fn checkpoint_rejects_missing_files_and_mismatched_configuration_or_storage() {
         Err(Error::InvalidSnapshot(_))
     ));
     assert!(matches!(
-        MemWal::<Merkle>::recover(cfg.clone(), memory(), Merkle, LruWrite::new(2)),
+        MemWal::<Merkle>::recover(cfg.clone(), memory(), Merkle::new(), LruWrite::new(2)),
         Err(Error::InvalidSnapshot(_))
     ));
     let engine = memory();

@@ -10,7 +10,7 @@ use auth_wal::storage::{MemoryStorage, StorageEngine};
 use auth_wal::timings::{CommitTimings, ProposeTimings};
 use clap::ValueEnum;
 
-use crate::{Args, BenchKey, BenchValue, EngineArg};
+use crate::{Args, BenchKey, BenchValue, EngineArg, VcArg};
 
 #[derive(Debug)]
 pub struct Measurements {
@@ -260,6 +260,13 @@ impl Report<'_> {
             ("engine_id", engine_id.to_string()),
             ("policy", value_name(g.policy)),
             ("vc", value_name(g.vc)),
+            (
+                "merkle_branching",
+                match g.vc {
+                    VcArg::MerkleBlake3 => g.merkle_branching.to_string(),
+                    _ => String::new(),
+                },
+            ),
             ("capacity", g.capacity.to_string()),
             ("low_watermark", g.watermark().to_string()),
             ("high_watermark", g.trigger().to_string()),

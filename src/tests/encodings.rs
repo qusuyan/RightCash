@@ -4,7 +4,7 @@ use super::common::*;
 use crate::set::Entry;
 use crate::storage::{MemoryConfig, MemoryStorage, StorageProposal};
 use crate::types::Hash;
-use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, rehash::Rehash};
+use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 
 /// Known answers for the consensus encodings (design §7.2, §7.3): a change
 /// to an item's bytes or domain, to the Merkle leaf or inner hash, or to
@@ -18,19 +18,17 @@ fn known_answers_for_the_encodings() {
         d.iter().map(|b| format!("{b:02x}")).collect()
     }
     let key = k("k");
-    let lthash = LtHash::new();
-    let mut state = VectorCommitment::<K>::empty(&lthash);
+    let mut lthash = LtHash::new();
     let no_entries = std::iter::empty::<(&K, EntryRef<'_>)>;
-    VectorCommitment::<K>::apply(&lthash, &mut state, &key, None, Some(EntryRef::Value(b"vv")));
-    let lattice_value = hex(&VectorCommitment::<K>::commitment(&lthash, &state, no_entries()));
+    VectorCommitment::<K>::apply(&mut lthash, &key, None, Some(EntryRef::Value(b"vv")));
+    let lattice_value = hex(&VectorCommitment::<K>::commitment(&mut lthash, no_entries()));
     VectorCommitment::<K>::apply(
-        &lthash,
-        &mut state,
+        &mut lthash,
         &key,
         Some(EntryRef::Value(b"vv")),
         Some(EntryRef::Tombstone),
     );
-    let lattice_tombstone = hex(&VectorCommitment::<K>::commitment(&lthash, &state, no_entries()));
+    let lattice_tombstone = hex(&VectorCommitment::<K>::commitment(&mut lthash, no_entries()));
     let memory_root = {
         use crate::storage::StorageEngine;
         let memory = MemoryStorage::<K, V>::new(MemoryConfig::default());
@@ -43,13 +41,20 @@ fn known_answers_for_the_encodings() {
     };
     let entries = [(k("a"), Entry::Value(k("1"))), (k("b"), Entry::Tombstone)];
     let items = || entries.iter().map(|(key, entry)| (key, entry.as_ref()));
-    let rehash = hex(&VectorCommitment::<K>::commitment(&Rehash, &(), items()));
-    let merkle = Merkle::new();
-    let mut state = VectorCommitment::<K>::empty(&merkle);
+    let rehash = hex(&VectorCommitment::<K>::commitment(&mut Rehash, items()));
+    let mut merkle = Merkle::new();
     for (key, entry) in &entries {
-        VectorCommitment::<K>::apply(&merkle, &mut state, key, None, Some(entry.as_ref()));
+        VectorCommitment::<K>::apply(&mut merkle, key, None, Some(entry.as_ref()));
     }
-    let merkle = hex(&VectorCommitment::<K>::commitment(&merkle, &state, items()));
+    let merkle = hex(&VectorCommitment::<K>::commitment(&mut merkle, items()));
+    // Three entries under branching 2: two levels above the leaves, the
+    // last leaf wrapped by a single-child node.
+    let mut three = entries.to_vec();
+    three.push((k("c"), Entry::Value(k("3"))));
+    let merkle_blake3 =
+        hex(&MerkleBlake3::<K>::new(2).commitment(three.iter().map(|(key, entry)| (key, entry.as_ref()))));
+    let merkle_blake3_params = hex(&MerkleBlake3::<K>::new(16).params_digest());
+    let merkle_blake3_empty = hex(&MerkleBlake3::<K>::new(16).commitment(no_entries()));
     let terms = Terms {
         scheme_id: "lthash",
         policy_name: "fifo",
@@ -65,6 +70,9 @@ fn known_answers_for_the_encodings() {
         ("lattice tombstone", lattice_tombstone.as_str()),
         ("rehash", rehash.as_str()),
         ("merkle", merkle.as_str()),
+        ("merkle-blake3", merkle_blake3.as_str()),
+        ("merkle-blake3 params", merkle_blake3_params.as_str()),
+        ("merkle-blake3 empty", merkle_blake3_empty.as_str()),
         ("root", root.as_str()),
         ("memory root", memory_root.as_str()),
     ];
@@ -84,6 +92,18 @@ fn known_answers_for_the_encodings() {
         (
             "merkle",
             "dbddcbc409901b07370f96e94c3d582031f62b769d1b5f6946337a921eb62d2b",
+        ),
+        (
+            "merkle-blake3",
+            "97a775388674769d8e4c94d9202dcdd59edd0fa09bb790c0a6c5edfd7a3f4b40",
+        ),
+        (
+            "merkle-blake3 params",
+            "e0a619d30b8033f8d50741b8e793f05ae056d64374b48da513d1fde8eb53b1bd",
+        ),
+        (
+            "merkle-blake3 empty",
+            "42c857c5b9c6a7991a716b8ffd0dea790b015dc91e4b80d4228a99f83a96dbe2",
         ),
         (
             "root",

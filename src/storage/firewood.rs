@@ -5,7 +5,8 @@
 //! - `DynProposal<'db>` borrows the database and `commit(self)` consumes it. The
 //!   adapter keeps the `Db` in an `Arc` and owns each `Proposal` with its
 //!   lifetime erased, holding an `Arc<Db>` next to it so the database always
-//!   outlives the proposal (the only `unsafe` in this crate; see `FwLive`).
+//!   outlives the proposal (one of two `unsafe` blocks in this crate, with
+//!   the AVX2 entry in `vc::blake3_lanes`; see `FwLive`).
 //! - A chain commits one proposal at a time: committing a child whose parent
 //!   is uncommitted fails with `ParentNotLatest`, so `commit` walks the
 //!   adapter-side parent links (kept inside each live state) and commits

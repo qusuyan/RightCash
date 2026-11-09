@@ -5,12 +5,19 @@
 //! update their state from it. Cost depends on the scheme and value sizes
 //! (Merkle updates a path; LtHash hashes changed entries). `rehash` ignores
 //! transitions and hashes all entries supplied to `commitment` instead.
-//! Methods take `&self` because a scheme instance carries its parameters
-//! (KZG trusted setup, Merkle depth). Proof methods arrive with milestone 5
+//! `merkle-blake3` also builds over all entries there, keeping its tree for
+//! as long as the snapshot lives, but reuses the parent's leaf
+//! hashes for the entries `apply` did not report, so it relies on every
+//! change being reported.
+//! A scheme instance carries its parameters (KZG trusted setup, Merkle
+//! branching) and the commitment state of one snapshot's set, so `apply` and
+//! `commitment` take `&mut self`. Proof methods arrive with milestone 5
 //! (design §7.4).
 
+pub(crate) mod blake3_lanes;
 pub mod lthash;
 pub mod merkle;
+pub mod merkle_blake3;
 pub mod rehash;
 
 use crate::set::EntryRef;
@@ -27,45 +34,52 @@ pub(crate) fn item_fields<'a, K: Key>(key: &'a K, entry: EntryRef<'a>) -> [&'a [
     }
 }
 
+/// A commitment scheme instance: its parameters together with the
+/// commitment state of one set. Each snapshot owns one, a clone of its
+/// parent's carried through the transitions between them (design §4, §7.1),
+/// so a clone must be cheap: large parameters (a KZG setup) sit behind an
+/// `Arc`.
 pub trait VectorCommitment<K: Key>: Clone + Send + Sync + 'static {
-    /// Commitment state of the set at a node; copied with the snapshot at
-    /// every proposal (design §4), so it must be cheap to clone.
-    type State: Clone + Send + Sync;
-
     /// Identifier hashed into the root preimage (design §7.3).
     fn scheme_id(&self) -> &'static str;
 
     /// Digest of the instance parameters (a KZG setup hash and slot count,
-    /// later). Enters the root preimage (design §7.3). Zeros for a
-    /// parameter-free scheme, the default (every v0 scheme).
+    /// later; `merkle-blake3`'s branching factor). Enters the root preimage
+    /// (design §7.3). Zeros for a parameter-free scheme, the default.
     fn params_digest(&self) -> Digest {
         [0u8; 32]
     }
 
-    /// Return fresh state representing no entries, including no tombstones.
-    fn empty(&self) -> Self::State;
+    /// The same scheme and parameters over no entries, including no
+    /// tombstones. The snapshot constructors start from this, whatever the
+    /// instance they are handed has seen.
+    fn empty(&self) -> Self;
 
-    /// Update mutable `state` for borrowed `key` changing from `old` to `new`.
-    /// `old` must describe the entry currently represented by `state`; `new`
-    /// describes the retained entry afterward. `None` means no entry, whereas
-    /// `Some(Tombstone)` is a present, authenticated delete marker.
+    /// Record borrowed `key` changing from `old` to `new`. `old` must
+    /// describe the entry this instance currently represents; `new`
+    /// describes the retained entry afterward. `None` means no entry,
+    /// whereas `Some(Tombstone)` is a present, authenticated delete marker.
     ///
     /// Returns `()`. Borrowed entry bytes need live only for this call. An
     /// incremental scheme updates its state; a whole-set scheme may ignore
-    /// this call and recompute from `commitment`'s complete entry iterator.
-    fn apply(&self, state: &mut Self::State, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>);
+    /// this call and recompute from `commitment`'s complete entry iterator
+    /// (`rehash`), or use it to reuse work kept from the parent
+    /// (`merkle-blake3`'s leaf hashes). The caller (`Snapshot::apply`'s
+    /// merge, design §4) therefore reports every key whose entry differs
+    /// between parent and child, exactly once, in ascending key order, on a
+    /// clone of the parent's committed instance, and then calls
+    /// `commitment` on that same instance.
+    fn apply(&mut self, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>);
 
-    /// Return the 32-byte digest of the set, without mutating `state`.
-    /// `state` is the result of applying all transitions; `entries` iterates
-    /// every retained entry, tombstones included, in ascending distinct-key
-    /// order. Both inputs must describe the same set.
+    /// Return the 32-byte digest of the set. The instance has applied all
+    /// transitions; `entries` iterates every retained entry, tombstones
+    /// included, in ascending distinct-key order. Both must describe the
+    /// same set. Called once per snapshot, when it is built (design §7.1); a
+    /// scheme may keep what it derives here (a whole-set Merkle tree), which
+    /// the snapshot then owns, but the digest must depend on the set alone.
     ///
-    /// Incremental schemes use `state` and may ignore the iterator. Whole-set
-    /// schemes consume `entries`; they do not sort or deduplicate it. The
-    /// resulting digest is one term of the combined auth_wal root.
-    fn commitment<'a>(
-        &self,
-        state: &Self::State,
-        entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>,
-    ) -> Digest;
+    /// Incremental schemes use their state and may ignore the iterator.
+    /// Whole-set schemes consume `entries`; they do not sort or deduplicate
+    /// it. The resulting digest is one term of the combined auth_wal root.
+    fn commitment<'a>(&mut self, entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest;
 }

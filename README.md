@@ -274,6 +274,51 @@ runs through auth_wal. `--help` lists every knob (capacity, policy, scheme,
 speculation rounds/margin, hints and hint noise, synthetic storage latency,
 seed, the per-phase breakdown).
 
+### Experiment runner and plots
+
+`scripts/run_experiments.py` runs the four experiment matrices one trial at
+a time (Zipf exponent sweep; LRU-write vs FIFO and rehash vs merkle-blake3
+on `tenkrandom` and `zipf` with precomputation, plus lthash and the sparse
+merkle on `tenkrandom`; bare firewood vs auth_wal vs auth_wal with
+precomputation on `zipf` and `tenkrandom`). Every trial uses 1M prefilled
+rows, 2400-op blocks hinted as 30 × 80 keys with 1–5 ms gaps, 50 warm-up and
+500 measured blocks, and the seeds 101, 202 and 303, shared across targets
+and interleaved (seed 101 of every configuration, then 202, then 303), so
+drift in the host's speed spreads over all configurations. The commitment
+experiment retains 8 revisions for all schemes, and merkle measures 100
+blocks, because the sparse Merkle reference scheme needs far more than 15 GB
+at 128 revisions and proposes in about 2 s per block. It writes
+`results.csv`, `breakdown.csv` and per-trial logs under
+`benchmark/results/2026-11-07-interleaved/<experiment>/`, and skips trials
+already recorded, so an interrupted run resumes. Experiments that run on
+several workloads prefix their trial ids with the workload
+(`zipf-lru-write-101`), so a workload added later runs into the same
+directory and lands in the same figures. Firewood v0.9.0 needs rustc
+1.94 or newer (`cargo +1.94 build --release -p auth_wal-benchmark`).
+
+A fifth experiment, `--only watermarks watermarks_capacity` (run with `--out
+benchmark/results/2026-11-07-watermarks`), varies capacity, high watermark
+and low watermark on `tenkrandom` with precomputation, around capacity
+10,000, high 7,900 and low 3,701. A block adds W = 2,100 new entries, so
+capacity − high = W, high − low = 2W − 1 and capacity − low = 3W − 1:
+eviction is strictly above capacity, so every third block evicts 3W with all
+but one victim inside the fixed capacity − low prediction. `watermarks`
+varies the high and the low watermark one at a time with the other two
+fixed; `watermarks_capacity` varies capacity with both watermarks shifted
+along, so the two gaps stay fixed and only the set size changes. These runs
+pass `--blocks-csv`, which writes one row per measured block (latencies,
+evicted keys, final storage ops, steps, phase times) for per-block analysis.
+`plot_watermarks.py` writes one figure per knob
+(`watermarks_{capacity,low_watermark,trigger}.png`), propose mean and p99
+side by side against bare firewood.
+
+`scripts/plot/plot_{zipf_sweep,policy,vc,baseline,watermarks}.py`
+(matplotlib, pandas) read those directories and write PNG/PDF figures plus a
+summary CSV to `<results>/plots/`; `--results` and `--out` override the paths.
+The figures show propose latency (mean and p99), one panel per workload;
+prefetch latency is in the summary CSVs. `--blog` renders the dark,
+captionless PNGs for the blog post.
+
 ## Tests and checks
 
 Library tests are grouped under [`src/tests/`](src/tests/mod.rs): `wal`,

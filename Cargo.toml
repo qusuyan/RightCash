@@ -8,7 +8,7 @@ edition = "2024"
 description = "Authenticated, bounded, in-memory set of recent writes between EVM validators and an authenticated storage engine"
 
 [features]
-# Firewood storage backend (design §10), the engine of record; path dependency on ../firewood.
+# Firewood storage backend (design §10), the engine of record; upstream ava-labs/firewood at the v0.9.0 release commit.
 firewood = ["dep:firewood", "dep:firewood-storage"]
 # Ethereum node hashing for the firewood backend (what the Avalanche adapter uses).
 # Select Ethereum mode when opening Firewood; upstream supports both modes.
@@ -23,8 +23,8 @@ parking_lot = "0.12"
 thiserror = "2"
 log = "0.4"
 tempfile = "3"
-firewood = { path = "../firewood/firewood", optional = true }
-firewood-storage = { path = "../firewood/storage", optional = true }
+firewood = { git = "https://github.com/ava-labs/firewood", rev = "a1282b68eb969e21e19aebf11e367a433896b5f9", optional = true }
+firewood-storage = { git = "https://github.com/ava-labs/firewood", rev = "a1282b68eb969e21e19aebf11e367a433896b5f9", optional = true }
 
 [profile.release]
 # Must stay "unwind" (the default): the worker catches a step's panic

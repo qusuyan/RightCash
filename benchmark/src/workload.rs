@@ -152,6 +152,8 @@ pub struct Recorder {
     /// Target counters at the end of warm-up, subtracted in `finish` so
     /// per-commit ratios cover the measured batches only.
     baseline_stats: Stats,
+    /// `--blocks-csv`: where `finish` writes one row per measured block.
+    blocks_csv: Option<std::path::PathBuf>,
 }
 
 impl Recorder {
@@ -170,6 +172,7 @@ impl Recorder {
             progress_every: g.progress_every,
             label: args.test_name.name(),
             baseline_stats: Stats::default(),
+            blocks_csv: g.blocks_csv.clone(),
         }
     }
 
@@ -224,7 +227,45 @@ impl Recorder {
         }
     }
 
+    /// `--blocks-csv`: one row per measured block. The phase columns are
+    /// empty for a bare engine. A write failure is reported, not fatal: the
+    /// run's CSV record is still printed.
+    fn write_blocks(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let us = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1e6);
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(
+            out,
+            "block,propose_us,commit_us,batch_ops,evicted,storage_ops,steps,speculative,finish_us,reads_us,storage_us"
+        )?;
+        for (i, (p, c)) in self.proposes.iter().zip(&self.commits).enumerate() {
+            match self.propose_details.get(i) {
+                Some(t) => writeln!(
+                    out,
+                    "{i},{},{},{},{},{},{},{},{},{},{}",
+                    us(*p),
+                    us(*c),
+                    t.batch_ops,
+                    t.evicted,
+                    t.storage_ops,
+                    t.steps,
+                    t.speculative,
+                    us(t.finish),
+                    us(t.reads),
+                    us(t.storage)
+                )?,
+                None => writeln!(out, "{i},{},{},,,,,,,,", us(*p), us(*c))?,
+            }
+        }
+        out.flush()
+    }
+
     pub fn finish(&self, stats: Stats) -> Measurements {
+        if let Some(path) = &self.blocks_csv
+            && let Err(e) = self.write_blocks(path)
+        {
+            eprintln!("[blocks-csv] could not write {}: {e}", path.display());
+        }
         let commits = self.commits.len() as u64;
         let per_commit = |x: u64| if commits == 0 { 0.0 } else { x as f64 / commits as f64 };
         let stats = stats.since(&self.baseline_stats);

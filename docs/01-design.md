@@ -332,8 +332,7 @@ struct Snapshot<K, V, C, P> {
     arena:      Arena,                              // Vec<Arc<[u8]>> chunks, one per block, plus live and total byte counts; compacted into one chunk when the dead bytes pass the live ones or the list passes 64 chunks
     policy:     Mutex<P>,                           // policy state as of this node (§6.1), copied with the entries; hints mark predictions in it (§9.2, R26), the one mutable thing in a snapshot
     policy_digest: Digest,                          // policy.state_digest() as of this node, a root term (§7.3)
-    vc:         C,                                  // scheme instance (parameters, §7.1; a KZG setup belongs behind an Arc, §12.2)
-    commitment: C::State,                           // incremental commitment of `entries` (nothing for `rehash`)
+    vc:         C,                                  // scheme instance: parameters (§7.1; a KZG setup belongs behind an Arc, §12.2) and the state for `entries` (incremental commitment, or what a whole-set scheme keeps: nothing for `rehash`, the tree for `merkle-blake3`)
     commitment_digest: Digest,                      // vc.commitment(..) as of this node, a root term (§7.3), computed once
     height:     u64,
     capacity:   usize,                              // in force at this node (§6.2; per-node state once it adapts, R4)
@@ -734,18 +733,20 @@ enter the root as the node's capacity term already does (§7.3, R23).
 ### 7.1 Trait
 
 ```rust
+/// An instance carries the scheme's parameters and one set's commitment state; each
+/// snapshot owns one, cloned from its parent's (§4), so a clone must be cheap.
 pub trait VectorCommitment<K: Key>: Clone + Send + Sync + 'static {
-    type State: Clone + Send + Sync;            // copied with the snapshot (§4): cheap to clone
     fn scheme_id(&self) -> &'static str;
     /// Digest of the instance parameters (KZG setup hash and slot count, Merkle
-    /// depth). Enters the root preimage (§7.3). Zeros by default: every v0 scheme.
+    /// depth, `merkle-blake3`'s branching factor). Enters the root preimage (§7.3). Zeros by default: parameter-free schemes.
     fn params_digest(&self) -> Digest { [0u8; 32] }
-    /// The scheme instance carries its parameters (KZG setup, Merkle depth), hence `&self`.
-    fn empty(&self) -> Self::State;
+    /// The same scheme and parameters over no entries; the snapshot constructors start from it.
+    fn empty(&self) -> Self;
     /// Incremental update for one key; `None` = absent.
-    fn apply(&self, state: &mut Self::State, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>);   // item = the entry under its key (§7.2); entries by reference to their bytes (§4)
-    /// 32 bytes, enters the root: from `state`, or from `entries`, the whole set in key order (a whole-set scheme, R34).
-    fn commitment<'a>(&self, state: &Self::State, entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest;
+    fn apply(&mut self, key: &K, old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>);   // item = the entry under its key (§7.2); entries by reference to their bytes (§4)
+    /// 32 bytes, enters the root: from the state, or from `entries`, the whole set in key order (a whole-set scheme, R34).
+    /// Called once per snapshot; may keep what it derives (`merkle-blake3`'s tree), which the snapshot owns.
+    fn commitment<'a>(&mut self, entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest;
 }
 ```
 
@@ -753,10 +754,20 @@ The trait is incremental by design: a scheme updates its commitment from
 `(old, new)` without touching the rest of the set, so its per-block cost is
 proportional to the batch rather than the set. `commitment` is also handed
 the whole set in key order (R34, clarification 32): a whole-set scheme
-keeps no state, ignores `apply` and hashes the entries there, once per
-proposal, at a cost proportional to the set; `Snapshot::apply` calls
+hashes the entries there, once per proposal, at a cost proportional to the
+set (`rehash` keeps no state and ignores `apply`; `merkle-blake3` uses
+`apply`'s reports to reuse its parent's leaf hashes, so the caller reports
+every changed key exactly once, in key order, on a clone of the parent's
+committed instance, as `Snapshot::apply`'s merge does); `Snapshot::apply` calls
 `commitment` once when it builds the child and keeps the digest, as it
-keeps the policy digest (§4). Which kind is cheaper is set size against
+keeps the policy digest (§4). The instance holds both the parameters and
+the state, as an eviction policy does (§6.1): each snapshot owns its own,
+cloned from the parent's, so `apply` and `commitment` take `&mut self` and a
+whole-set scheme can keep what it builds there (`merkle-blake3` its tree,
+which the snapshot owns and frees with itself); the digest still depends on
+the set alone. An earlier version kept the state in a separate associated
+type next to a shared `&self` instance; nothing shared the instance, so the
+two were merged. Which kind is cheaper is set size against
 block size (§7.2). Proof methods (`prove`, `verify`) are added with
 milestone 5 (§7.4); v0 code carries none of them (R20).
 
@@ -767,6 +778,7 @@ milestone 5 (§7.4); v0 code carries none of them (R20).
 | `lthash` (v0 default) | 2 KiB lattice-hash vector (1024 × u16 lanes) | one XOF + lane add/sub | none (set-level only) | Additively homomorphic: `C ← C − H(k,old) + H(k,new)`. Cheap, order-independent, authenticates the set as a whole. |
 | `kzg` (milestone 5) | one G1 element (48 B, hashed to 32 for the root) + `key → slot` map (a slot's value commits to the §7.2 entry item) | one scalar mult | yes, constant size | Slot count must exceed `capacity` by a safety factor (a `capacity`-slot table is guaranteed to collide near full occupancy); collision policy is open (§12.2). Trusted setup of slot-count size. The slot map is consensus state: it lives on the `Snapshot`, copied with the entries (one more per-key map in the per-proposal copy, §12.14), to be settled together with §12.2 in milestone 5. No code in v0. |
 | `merkle` (reference) | whole sparse Merkle tree (persistent) over `SHA-256(key)`, depth 256, leaf = the entry item below | 256 hashes per update | yes | No slots, so no collisions; parameter-free. Slow but proof-friendly baseline for tests and benchmarks; its persistent tree is cloned with the snapshot in O(1). |
+| `merkle-blake3` | the snapshot's `b`-ary tree (all levels in one buffer, `Arc`, shared by a clone until the child's `commitment` replaces it) and the keys `apply` reported since | a key clone per op; per proposal one keyed BLAKE3 per changed entry and one per run of `b` hashes per level | yes (milestone 5; the tree is kept for it) | Whole-set scheme, built bottom-up at `commitment`: a leaf is keyed BLAKE3 (key `derive_key("auth_wal/merkle-blake3 leaf", "")`) over the entry item below; each level groups the one below into runs of `b` in key order (the last run may be shorter, a run of one is still hashed) and hashes each run's concatenation with keyed BLAKE3 (key `derive_key("auth_wal/merkle-blake3 node", "")`); the build stops at the first level of one hash (not, as first described, once a level has fewer than `b` hashes, which would add a single-child node above a level of exactly one or exactly `b` hashes). The commitment is `derive_key("auth_wal/merkle-blake3")` over `u64 LE` entry count ‖ top (32 zero bytes when empty); `params_digest` is `derive_key("auth_wal/merkle-blake3 params")` over `b` as `u64 LE`. Branching `b ≥ 2`, default 16 (a full node is 512 bytes, eight 64-byte blocks of one 1 KiB BLAKE3 chunk; any `b` up to 32 stays within one chunk); `--merkle-branching` in the benchmark. Memory: about `32·n·b/(b−1)` bytes per retained snapshot (0.34 MB at 10k entries, 3.4 MB at 100k, `b` = 16), times the retained revisions and live proposals; a child's clone of the state shares the parent's tree only until the child's `commitment` replaces it. Computation, identical in result to the full build: `apply` records each changed key with whether it was in the parent and is in the child, and `commitment` copies the parent's leaf hash for every entry no transition touched (the parent's entry at position untouched-before + replaced-or-removed-before, both counted in key order), hashing only the rest; the levels above are rebuilt, since an insert or removal shifts every later run; transitions that do not add up against the parent's leaves fall back to hashing every leaf (a debug assertion), and debug builds also compare every reused leaf with its entry's hash, which catches a change never reported to `apply`. Leaves and nodes are hashed eight at a time, one per 32-bit lane of AVX2 (`src/vc/blake3_lanes.rs`, checked against the blake3 crate; without AVX2 each message is a plain `blake3::keyed_hash`, which a portable lane loop did not beat): every leaf of an item up to 1 KiB and every node with `b` ≤ 32 is one BLAKE3 chunk. The tree is one allocation: a propose that allocated each level separately blocked for 1–4 ms in about 3% of blocks on the allocator lock while the precomputation worker freed memory. Measured in situ (tenkrandom, 1M rows, capacity 10,000 / trigger 7,900 / low 3,701, precomputation on, 200 blocks, 3 seeds): the commitment costs 295–309 µs mean, 456–602 µs p99, against 912 µs / 5.0 ms for one blake3 call per hash and no reuse, and 150–163 µs / 356–440 µs for `rehash`; with the worker off (and the tree still allocated per level), 307 µs / 416 µs. |
 | `rehash` (R34, clarification 32) | none | nothing per op; one keyed BLAKE3 (`derive_key`, domain `auth_wal/rehash`) per proposal over `u64 LE` entry count ‖ every entry item in key order | none (set-level only) | Whole-set scheme. The entries are serialised into one buffer and hashed with one `update`: 0.36–0.45 ms at 10k entries of 32-byte keys and values (0.77 MB; the same hash as 30k small `update` calls costs 1.6 ms, `scratchpad` micro-benchmark), against 1.1 µs per lattice item. In situ it costs 0.66–0.75 ms per block at 10k while a lattice item costs 2.7–2.8 µs (§14 "Clarification 32"), so it wins while the block's items (inserts + 2 × rewrites + victims) exceed about a fortieth of the set: 250 items at 10k, far under both benchmark workloads (about 1570 on `zipf`, 4800 on `tenkrandom`), where it cuts propose from 10.5 to 6.9 ms and from 21.5 to 9.1 ms; at 100k (7.7 MB, several ms) the lattice wins for `zipf`-sized blocks. `lthash` stays the default until the owner decides. |
 
 **Lattice accumulator encoding** (shared by `lthash` and `MemoryStorage`'s
@@ -1054,8 +1066,10 @@ closed flag.
   inline keys, 48 with `Arc` keys): about 1.3 MB per snapshot at 10k
   entries with inline 32-byte keys, plus up to twice the live value bytes
   in chunks (0.3 MB of 32-byte values, shared), about 0.8 MB with `Arc`
-  keys. The ring keeps K of them, so K = 128 retains 100–200 MB of
-  snapshots, plus one per live proposal (a few at most: the blocks being
+  keys. The scheme's state comes on top: nothing for `rehash`, 2 KiB for
+  `lthash`, and for `merkle-blake3` the snapshot's own tree, about 0.34 MB
+  at 10k entries (§7.2). The ring keeps K of them, so K = 128 retains
+  100–200 MB of snapshots (about 44 MB more under `merkle-blake3`), plus one per live proposal (a few at most: the blocks being
   verified ahead and competing candidates). `WithRevisions` is the knob,
   and folding the policy's heights into the records (§12.14) the lever. The K-ring, not handles,
   bounds memory: a dropped handle to a committed node frees nothing until the
@@ -1622,8 +1636,9 @@ engine. A fresh engine reports
 `src/storage/firewood.rs`). The mechanics above are realised as: (a) the
 `Db` lives in an `Arc` owned by the engine (a plain `Option`, taken by
 `close(&mut self)`, R19) and each proposal is stored with its borrow lifetime
-erased by a `transmute` next to an `Arc<Db>` clone that outlives it, the one
-`unsafe` in the crate; the clone lives only in the proposal's live state and
+erased by a `transmute` next to an `Arc<Db>` clone that outlives it, one of
+the crate's two `unsafe` blocks (the other enters the AVX2 lanes of
+`merkle-blake3`'s hashing after a CPU check, §7.2); the clone lives only in the proposal's live state and
 is replaced at commit by a `Weak<Db>`, which lets the committed handle
 propose on the committed state (item 4) without pinning the database, so
 `close` succeeds once no live (uncommitted and not failed) proposal is alive
@@ -1803,7 +1818,7 @@ marker record the boundary; bare-engine runs have no set and are exempt.
 `--low-watermark` (default 70% of capacity, rounded down, a consensus parameter),
 `--high-watermark` (local precomputation threshold, default 90% of capacity, rounded down;
 actual eviction remains at capacity, §6.2), `--revisions` (K),
-`--policy {fifo,lru-write}`, `--vc {lthash,merkle,rehash}`, `--speculate`,
+`--policy {fifo,lru-write}`, `--vc {lthash,merkle,merkle-blake3,rehash}` (`--merkle-branching`), `--speculate`,
 `--speculation-rounds`, `--speculation-min-step` (default 256 distinct pending
 keys), `--speculation-margin`,
 `--firewood-commit-permits` (positive; defaults to rounds for speculative
@@ -2300,7 +2315,8 @@ auth_wal/
   src/types.rs                Key/Value bounds, Hash, Digest, EMPTY_ROOT, BatchOp<K, V>, Error
   src/set.rs                  Snapshot (the whole set at one node: sorted records, value arena) and its one-pass batch application, Entry<V>, EntryRef, Entries
   src/policy/{mod,fifo,lru_write}.rs   EvictionPolicy (writes / hint_writes / predicted / reset_hints / validate / state_digest), per-policy prediction state and reconciliation, split_order, merge_index, order_digest, params_digest, validate_watermarks; the v0 policies on sorted arrays, each with its own watermarks
-  src/vc/{mod,lthash,merkle,rehash}.rs   VectorCommitment (commitment is handed the entries, R34), the entry item's fields; lattice, sparse Merkle reference, whole-set rehash
+  src/vc/{mod,lthash,merkle,merkle_blake3,rehash}.rs   VectorCommitment (commitment is handed the entries, R34), the entry item's fields; lattice, sparse Merkle reference, bottom-up BLAKE3 Merkle, whole-set rehash
+  src/vc/blake3_lanes.rs   eight keyed single-chunk BLAKE3 hashes at once in AVX2 lanes (blake3 per message without AVX2), for merkle_blake3
   src/root.rs                 root composition (§7.3)
   src/lattice.rs              lattice-hash accumulator (add/remove fields, digest) shared by lthash and MemoryStorage
   src/storage/{mod,memory,firewood,contract_tests}.rs

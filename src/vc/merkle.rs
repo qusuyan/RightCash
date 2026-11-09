@@ -2,7 +2,7 @@
 //! baseline for tests and benchmarks. Leaves are addressed by `SHA-256(key)`
 //! at depth 256 (parameter-free, assuming no SHA-256 address collisions);
 //! distinct keys with the same address are not handled separately. A leaf hashes the
-//! §7.2 entry item. The state is the whole (persistent) tree, cloned with the
+//! §7.2 entry item. The scheme instance holds the whole (persistent) tree, cloned with the
 //! snapshot in O(1), since `apply(old, new)` must recompute a path.
 //!
 //! Encoding: a leaf is `SHA-256(0x00 || item)`, the item's fields (`tag`,
@@ -21,14 +21,12 @@ use crate::set::EntryRef;
 use crate::types::{Digest, Key, len_prefix};
 use crate::vc::{VectorCommitment, item_fields};
 
-/// Parameter-free: depth is fixed at 256.
-#[derive(Clone, Default)]
-pub struct Merkle;
-
 pub const DEPTH: u32 = 256;
 
+/// Parameter-free (depth is fixed at 256); the state is the whole tree,
+/// cloned in O(1).
 #[derive(Clone)]
-pub struct MerkleState {
+pub struct Merkle {
     root: Digest,
     /// Persistent map of occupied node positions `(level, path prefix)` to
     /// hashes; absent = default (empty-subtree) hash for that level.
@@ -36,8 +34,18 @@ pub struct MerkleState {
 }
 
 impl Merkle {
+    /// The scheme over no entries.
     pub fn new() -> Self {
-        Self
+        Self {
+            root: defaults()[0],
+            nodes: im::OrdMap::new(),
+        }
+    }
+}
+
+impl Default for Merkle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -91,24 +99,19 @@ fn prefix(path: &Digest, level: u32) -> Digest {
 }
 
 impl<K: Key> VectorCommitment<K> for Merkle {
-    type State = MerkleState;
-
     fn scheme_id(&self) -> &'static str {
         "merkle"
     }
 
-    fn empty(&self) -> Self::State {
-        MerkleState {
-            root: defaults()[0],
-            nodes: im::OrdMap::new(),
-        }
+    fn empty(&self) -> Self {
+        Self::new()
     }
 
-    /// Replace `key`'s leaf in mutable `state` with the hash of `new`, or the
-    /// empty leaf for `None`, then recompute its ancestors through the root.
-    /// `_old` is unused because the tree already stores the path's hashes.
-    /// Returns `()`; other paths remain structurally shared with cloned states.
-    fn apply(&self, state: &mut Self::State, key: &K, _old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>) {
+    /// Replace `key`'s leaf with the hash of `new`, or the empty leaf for
+    /// `None`, then recompute its ancestors through the root. `_old` is
+    /// unused because the tree already stores the path's hashes. Returns
+    /// `()`; other paths remain structurally shared with clones.
+    fn apply(&mut self, key: &K, _old: Option<EntryRef<'_>>, new: Option<EntryRef<'_>>) {
         let defaults = defaults();
         let path: Digest = Sha256::digest(key.as_ref()).into();
         let mut hash = match new {
@@ -121,9 +124,9 @@ impl<K: Key> VectorCommitment<K> for Merkle {
             // Missing map entries mean the default empty-subtree hash. Remove
             // nodes that return to that hash so deletes do not leave empty paths.
             if hash == defaults[level as usize] {
-                state.nodes.remove(&position);
+                self.nodes.remove(&position);
             } else {
-                state.nodes.insert(position, hash);
+                self.nodes.insert(position, hash);
             }
             if level == 0 {
                 break;
@@ -133,7 +136,7 @@ impl<K: Key> VectorCommitment<K> for Merkle {
             let mut sibling = position.1;
             let byte = ((level - 1) / 8) as usize;
             sibling[byte] ^= 0x80 >> ((level - 1) % 8);
-            let sibling_hash = state
+            let sibling_hash = self
                 .nodes
                 .get(&(level, sibling))
                 .copied()
@@ -147,15 +150,11 @@ impl<K: Key> VectorCommitment<K> for Merkle {
             };
             level -= 1;
         }
-        state.root = hash;
+        self.root = hash;
     }
 
-    fn commitment<'a>(
-        &self,
-        state: &Self::State,
-        _entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>,
-    ) -> Digest {
-        state.root
+    fn commitment<'a>(&mut self, _entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest {
+        self.root
     }
 }
 
@@ -191,8 +190,7 @@ mod tests {
 
     #[test]
     fn incremental_root_matches_the_recursive_oracle() {
-        let scheme = Merkle::new();
-        let mut state = VectorCommitment::<K>::empty(&scheme);
+        let mut scheme = Merkle::new();
         let mut entries: BTreeMap<K, Entry<V>> = BTreeMap::new();
         let mut rng = Rng(11);
         for round in 0..200u32 {
@@ -203,7 +201,7 @@ mod tests {
                 _ => Some(Entry::Value(format!("v{round}").into_bytes())),
             };
             let old = entries.get(&key).map(|entry| entry.as_ref());
-            VectorCommitment::<K>::apply(&scheme, &mut state, &key, old, new.as_ref().map(|e| e.as_ref()));
+            VectorCommitment::<K>::apply(&mut scheme, &key, old, new.as_ref().map(|e| e.as_ref()));
             match new {
                 None => entries.remove(&key),
                 Some(entry) => entries.insert(key, entry),
@@ -213,7 +211,7 @@ mod tests {
                 .map(|(key, entry)| (Sha256::digest(key).into(), leaf(key, entry.as_ref())))
                 .collect();
             leaves.sort();
-            let root = VectorCommitment::<K>::commitment(&scheme, &state, std::iter::empty::<(&K, EntryRef<'_>)>());
+            let root = VectorCommitment::<K>::commitment(&mut scheme, std::iter::empty::<(&K, EntryRef<'_>)>());
             assert_eq!(root, oracle(&leaves, 0), "round {round}");
         }
     }

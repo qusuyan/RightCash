@@ -5,7 +5,7 @@ use crate::AuthWal;
 use crate::policy::{EvictionPolicy, Fifo, LruWrite};
 use crate::storage::{StorageEngine, StorageProposal};
 use crate::types::{BatchOp, Error};
-use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, rehash::Rehash};
+use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -124,6 +124,7 @@ fn speculation_matches_the_plain_path_bulk_rule() {
     speculation_matches_the_plain_path(|| LruWrite::<K>::new(12), LtHash::new, 4);
     speculation_matches_the_plain_path(|| LruWrite::<K>::new(12), Merkle::new, 4);
     speculation_matches_the_plain_path(|| LruWrite::<K>::new(12), Rehash::new, 4);
+    speculation_matches_the_plain_path(|| LruWrite::<K>::new(12), || MerkleBlake3::new(3), 4);
 }
 
 #[test]
@@ -131,6 +132,7 @@ fn watermark_speculation_matches_the_plain_path() {
     speculation_matches_the_plain_path(|| Fifo::<K>::new(20).with_trigger(20), LtHash::new, 4);
     speculation_matches_the_plain_path(|| LruWrite::<K>::new(20).with_trigger(20), LtHash::new, 4);
     speculation_matches_the_plain_path(|| Fifo::<K>::new(20).with_trigger(20), Merkle::new, 4);
+    speculation_matches_the_plain_path(|| LruWrite::<K>::new(20).with_trigger(20), MerkleBlake3::default, 4);
 }
 
 /// Small chains still fold every pending hint and final correction into

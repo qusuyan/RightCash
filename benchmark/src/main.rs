@@ -20,6 +20,7 @@ use auth_wal::storage::{MemoryConfig, MemoryStorage, StorageEngine};
 use auth_wal::vc::VectorCommitment;
 use auth_wal::vc::lthash::LtHash;
 use auth_wal::vc::merkle::Merkle;
+use auth_wal::vc::merkle_blake3::MerkleBlake3;
 use auth_wal::vc::rehash::Rehash;
 use auth_wal::{AuthWal, Config, Consensus, Local};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -121,6 +122,13 @@ pub struct GlobalOpts {
     pub vc: VcArg,
     #[arg(
         long,
+        default_value_t = auth_wal::vc::merkle_blake3::DEFAULT_BRANCHING,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..),
+        help = "Branching factor of `--vc merkle-blake3` (at least 2)"
+    )]
+    pub merkle_branching: usize,
+    #[arg(
+        long,
         default_value_t = false,
         help = "Speculative eviction: send predicted victims early (design §9)"
     )]
@@ -206,6 +214,11 @@ pub struct GlobalOpts {
         help = "Print where propose and commit spent their time, phase by phase over the measured blocks, before the CSV record (write-set targets; design §9.5)"
     )]
     pub breakdown: bool,
+    #[arg(
+        long,
+        help = "Write one CSV row per measured block to this file: propose and commit latency and, for write-set targets, the block's evicted keys, final storage ops, steps and phase times"
+    )]
+    pub blocks_csv: Option<PathBuf>,
 }
 
 impl GlobalOpts {
@@ -263,6 +276,8 @@ pub enum VcArg {
     Lthash,
     /// Sparse Merkle tree, the reference scheme (design §7.2).
     Merkle,
+    /// Bottom-up BLAKE3 Merkle tree over the whole set, `--merkle-branching`-ary (design §7.2).
+    MerkleBlake3,
     /// Whole-set rehash (design §7.2).
     Rehash,
 }
@@ -318,7 +333,7 @@ fn wal_config(g: &GlobalOpts) -> Config {
 }
 
 /// The write set over `engine` with the flags' policy and scheme: one of the
-/// six monomorphizations (design §3).
+/// eight monomorphizations (design §3).
 fn write_set<S>(config: Config, g: &GlobalOpts, engine: S) -> Result<Box<dyn Target>, Box<dyn Error>>
 where
     S: StorageEngine<BenchKey, BenchValue>,
@@ -340,9 +355,13 @@ where
     match (g.policy, g.vc) {
         (PolicyArg::Fifo, VcArg::Lthash) => open(config, engine, fifo(), LtHash::new()),
         (PolicyArg::Fifo, VcArg::Merkle) => open(config, engine, fifo(), Merkle::new()),
+        (PolicyArg::Fifo, VcArg::MerkleBlake3) => open(config, engine, fifo(), MerkleBlake3::new(g.merkle_branching)),
         (PolicyArg::Fifo, VcArg::Rehash) => open(config, engine, fifo(), Rehash::new()),
         (PolicyArg::LruWrite, VcArg::Lthash) => open(config, engine, lru(), LtHash::new()),
         (PolicyArg::LruWrite, VcArg::Merkle) => open(config, engine, lru(), Merkle::new()),
+        (PolicyArg::LruWrite, VcArg::MerkleBlake3) => {
+            open(config, engine, lru(), MerkleBlake3::new(g.merkle_branching))
+        }
         (PolicyArg::LruWrite, VcArg::Rehash) => open(config, engine, lru(), Rehash::new()),
     }
 }

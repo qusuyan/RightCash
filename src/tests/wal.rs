@@ -5,7 +5,7 @@ use crate::policy::{EvictionPolicy, Fifo, LruWrite};
 use crate::set::Entry;
 use crate::storage::{MemoryConfig, MemoryStorage, StorageProposal};
 use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash};
-use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, rehash::Rehash};
+use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 use crate::{AuthWal, Config};
 use std::collections::BTreeMap;
 
@@ -339,6 +339,16 @@ fn plain_path_rehash_lru_write() {
 }
 
 #[test]
+fn plain_path_merkle_blake3_fifo() {
+    suite(|| Fifo::new(2), || MerkleBlake3::new(2));
+}
+
+#[test]
+fn plain_path_merkle_blake3_lru_write() {
+    suite(|| LruWrite::new(2), MerkleBlake3::default);
+}
+
+#[test]
 fn lru_write_and_fifo_differ_on_a_same_value_rewrite() {
     // Under lru-write a same-value rewrite moves the key, so the root differs
     // from an empty block's; under fifo the two blocks share a root (design
@@ -374,8 +384,18 @@ fn schemes_and_policies_give_distinct_roots() {
     let r5 = open(5, 3, Fifo::new(2), LtHash::new())
         .update(block.clone(), None)
         .unwrap();
-    let r6 = open(4, 3, Fifo::new(2), Rehash::new()).update(block, None).unwrap();
-    let roots = [r1, r2, r3, r4, r5, r6];
+    let r6 = open(4, 3, Fifo::new(2), Rehash::new())
+        .update(block.clone(), None)
+        .unwrap();
+    // One entry: the set digest is the same for every branching factor, so
+    // only the parameter digest tells these two apart.
+    let r7 = open(4, 3, Fifo::new(2), MerkleBlake3::new(2))
+        .update(block.clone(), None)
+        .unwrap();
+    let r8 = open(4, 3, Fifo::new(2), MerkleBlake3::new(16))
+        .update(block, None)
+        .unwrap();
+    let roots = [r1, r2, r3, r4, r5, r6, r7, r8];
     for (i, a) in roots.iter().enumerate() {
         for b in &roots[i + 1..] {
             assert_ne!(a, b);
@@ -435,6 +455,7 @@ fn new_accepts_a_populated_set_with_matching_policy_and_root() {
     new_with_populated_set(LtHash::new(), Fifo::new(2).with_trigger(3));
     new_with_populated_set(Merkle::new(), LruWrite::new(2).with_trigger(3));
     new_with_populated_set(Rehash::new(), LruWrite::new(2).with_trigger(3));
+    new_with_populated_set(MerkleBlake3::new(2), Fifo::new(2).with_trigger(3));
 }
 
 #[test]
