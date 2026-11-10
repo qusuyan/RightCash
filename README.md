@@ -3,7 +3,8 @@
 An authenticated, bounded, in-memory set of recent writes that sits between the
 EVM validators (`Avax-pEVM`, `libevm`) and an authenticated storage engine
 (`qmdb-ffi` or `firewood`), exposing the same Go `ffi` interface so validators
-need no code changes.
+need no code changes. See [here](https://www.qusuyan.com/byzantine%20fault%20tolerance/storage%20systems/2026/11/06/right-cash.html)
+for my blog post. 
 
 - `docs/00-project-description.md`: the requirements as stated.
 - `docs/01-design.md`: the design (write set, eviction policy, vector
