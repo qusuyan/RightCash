@@ -1,4 +1,4 @@
-//! `auth_wal`: an authenticated, bounded, in-memory set of recent writes that
+//! `right_cash`: an authenticated, bounded, in-memory set of recent writes that
 //! sits between the EVM validators and an authenticated storage engine.
 //!
 //! See `docs/01-design.md`. Module map (design §13):
@@ -17,7 +17,7 @@
 //! | [`timings`]   | §9.5, §11 | per-call phase timings of `propose` and `commit`, read by the benchmark's `--breakdown` |
 //! | `persist`     | §12.6 | clean-shutdown checkpoint encoding, validation, and atomic publication |
 //!
-//! Threading (design §3, R19): [`AuthWal`] is the **writer**; every operation
+//! Threading (design §3, R19): [`RightCash`] is the **writer**; every operation
 //! that changes state takes `&mut self`, so the type system serialises them.
 //! [`Reader`] and [`proposal::Handle`] are the `Send + Sync` read side. The
 //! shared mutable structures are the registry behind one mutex and a
@@ -69,7 +69,7 @@ pub struct Consensus {
 #[derive(Clone, Debug)]
 pub struct Local {
     /// Clean-shutdown checkpoint file. `close` saves the latest committed
-    /// snapshot here; `AuthWal::recover` reads it with matching storage.
+    /// snapshot here; `RightCash::recover` reads it with matching storage.
     /// None disables checkpointing (the default for in-memory/benchmark use).
     pub snapshot_path: Option<PathBuf>,
     /// Committed revisions kept for `revision()` (design §8); at least 2
@@ -108,7 +108,7 @@ impl Default for Local {
 impl Local {
     /// The engine window these settings need (design §8): `revisions * rounds`
     /// when speculating on an engine that commits chained proposals separately (`S::COMMITS_CHAIN_LINKS_SEPARATELY`), else `revisions`.
-    /// One formula for `AuthWal::new`'s check, the benchmark's engine config
+    /// One formula for `RightCash::new`'s check, the benchmark's engine config
     /// and the adapter's `New` (milestone 4).
     pub fn engine_window(&self, commits_chain_links_separately: bool) -> usize {
         if self.speculate && commits_chain_links_separately {
@@ -119,7 +119,7 @@ impl Local {
     }
 }
 
-/// Configuration of an [`AuthWal`] instance (design §3). The split lets the
+/// Configuration of an [`RightCash`] instance (design §3). The split lets the
 /// type system keep local settings out of the root preimage, whose terms
 /// come from the scheme, the policy, the engine and the node (its capacity
 /// among them), never from `Local`.
@@ -348,7 +348,7 @@ where
 /// Type parameters follow design §4 and §13: `K`/`V` key and value types,
 /// `C` the vector commitment scheme, `P` the eviction policy, `S` the storage
 /// engine.
-pub struct AuthWal<K, V, C, P, S>
+pub struct RightCash<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -396,7 +396,7 @@ where
     last_commit: CommitTimings,
 }
 
-impl<K, V, C, P, S> AuthWal<K, V, C, P, S>
+impl<K, V, C, P, S> RightCash<K, V, C, P, S>
 where
     K: Key,
     V: Value,
@@ -695,7 +695,7 @@ where
     /// Rejects a closed/poisoned writer, a root already equal to the head's
     /// (`ProposalConsumed`), a dropped parent (`ProposalOrphaned`), or a parent
     /// that is not the current head node (`ParentUncommitted`). This method does
-    /// not commit parent auth_wal nodes automatically.
+    /// not commit parent right_cash nodes automatically.
     ///
     /// If the node owns a different storage view from the head, commit that view
     /// and its speculative storage ancestors first. On failure, leave the registry
@@ -732,7 +732,7 @@ where
             if let Err(e) = node.storage_view().commit() {
                 if node.steps() > 0 {
                     // The storage chain can fail after earlier links commit;
-                    // the unchanged auth_wal head would then lag storage.
+                    // the unchanged right_cash head would then lag storage.
                     self.poisoned = Some(e.to_string());
                 }
                 return Err(e);
@@ -803,7 +803,7 @@ where
                 Some((finished.view, finished.steps))
             }
             Err(error) => {
-                log::debug!("auth_wal: {error}; taking the plain path");
+                log::debug!("right_cash: {error}; taking the plain path");
                 counters.fallbacks.fetch_add(1, Ordering::Relaxed);
                 None
             }
@@ -967,7 +967,7 @@ where
     }
 }
 
-/// What `AuthWal::resolve` answers: the node a call is about and the head.
+/// What `RightCash::resolve` answers: the node a call is about and the head.
 type Resolved<K, V, C, P, S> = (NodeRef<K, V, C, P, S>, NodeRef<K, V, C, P, S>);
 
 /// Return worker operations from borrowed `snapshot` and two owned-key iterators:
@@ -1009,7 +1009,7 @@ mod send_sync {
 
     type K = std::sync::Arc<[u8]>;
     type V = std::sync::Arc<[u8]>;
-    type Db = crate::AuthWal<K, V, LtHash, Fifo<K>, MemoryStorage<K, V>>;
+    type Db = crate::RightCash<K, V, LtHash, Fifo<K>, MemoryStorage<K, V>>;
     type Rd = crate::Reader<K, V, LtHash, Fifo<K>, MemoryStorage<K, V>>;
     type Hd = crate::proposal::Handle<K, V, LtHash, Fifo<K>, MemoryStorage<K, V>>;
 

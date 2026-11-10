@@ -212,7 +212,7 @@ impl<K: Key> EvictionPolicy<K> for Fifo<K> {
         "fifo"
     }
 
-    /// SHA-256 of `"auth_wal/policy-params" || low_watermark (u64 LE)`;
+    /// SHA-256 of `"right_cash/policy-params" || low_watermark (u64 LE)`;
     /// no local prediction parameters (design §6.1, §7.3).
     fn params_digest(&self) -> Digest {
         params_digest(self.low_watermark)

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::common::*;
-use crate::AuthWal;
+use crate::RightCash;
 use crate::policy::{EvictionPolicy, Fifo, LruWrite};
 use crate::proposal::Handle;
 use crate::set::Entry;
@@ -14,7 +14,7 @@ use crate::storage::{MemoryConfig, MemoryStorage, StorageEngine, StorageProposal
 use crate::types::{BatchOp, Error, Hash, Result};
 use crate::vc::lthash::LtHash;
 
-const FINAL_METADATA: &[u8] = b"auth_wal test finalization";
+const FINAL_METADATA: &[u8] = b"right_cash test finalization";
 
 /// Every `step`-th worker-thread propose without metadata, every `read`-th
 /// worker-thread read, and every `f`-th worker-thread propose with the
@@ -61,7 +61,7 @@ impl Faults {
 }
 
 fn on_worker() -> bool {
-    std::thread::current().name() == Some("auth_wal-worker")
+    std::thread::current().name() == Some("right_cash-worker")
 }
 
 pub struct Flaky {
@@ -314,7 +314,7 @@ pub fn differential<P: EvictionPolicy<K>>(policy: impl Fn() -> P, rounds: u32, s
         }),
         faults: faults.clone(),
     };
-    let mut spec: AuthWal<K, V, LtHash, P, Flaky> = new_empty(config, engine, policy(), LtHash::new()).unwrap();
+    let mut spec: RightCash<K, V, LtHash, P, Flaky> = new_empty(config, engine, policy(), LtHash::new()).unwrap();
     let mut plain = open(capacity, 4, policy(), LtHash::new());
     let (universe, hot) = (60u64, 14u64);
     let key = |i: u64| format!("k{i:03}").into_bytes();

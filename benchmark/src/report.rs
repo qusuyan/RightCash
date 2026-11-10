@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use auth_wal::speculate::SpeculationStats;
-use auth_wal::storage::{MemoryStorage, StorageEngine};
-use auth_wal::timings::{CommitTimings, ProposeTimings};
 use clap::ValueEnum;
+use right_cash::speculate::SpeculationStats;
+use right_cash::storage::{MemoryStorage, StorageEngine};
+use right_cash::timings::{CommitTimings, ProposeTimings};
 
 use crate::{Args, BenchKey, BenchValue, EngineArg, VcArg};
 
@@ -228,14 +228,14 @@ pub struct Report<'a> {
 impl Report<'_> {
     /// The CSV columns, name and value, in order: one list serves the
     /// header and the record, so the two cannot drift apart. `target` names
-    /// the bare engine of `--baseline`, else `auth_wal`.
+    /// the bare engine of `--baseline`, else `right_cash`.
     fn columns(&self) -> Vec<(&'static str, String)> {
         let g = &self.args.global_opts;
         let m = &self.m;
         let target = if g.baseline {
             value_name(g.engine)
         } else {
-            "auth_wal".to_string()
+            "right_cash".to_string()
         };
         let us = |d: Duration| format!("{:.1}", micros(d));
         let elapsed = m.elapsed.as_secs_f64();
@@ -248,7 +248,7 @@ impl Report<'_> {
             }
             #[cfg(feature = "firewood")]
             EngineArg::Firewood => {
-                <auth_wal::storage::FirewoodStorage as StorageEngine<BenchKey, BenchValue>>::ENGINE_ID
+                <right_cash::storage::FirewoodStorage as StorageEngine<BenchKey, BenchValue>>::ENGINE_ID
             }
             #[cfg(not(feature = "firewood"))]
             EngineArg::Firewood => unreachable!("build_target rejects an unavailable engine"),

@@ -1,7 +1,7 @@
 //! Speculative execution compared with the plain path, including pipelining.
 
 use super::common::*;
-use crate::AuthWal;
+use crate::RightCash;
 use crate::policy::{EvictionPolicy, Fifo, LruWrite};
 use crate::storage::{StorageEngine, StorageProposal};
 use crate::types::{BatchOp, Error};
@@ -262,8 +262,8 @@ fn finalization_keeps_hints_for_the_next_pipelined_block() {
 /// speculative on the kept chain and its root is the plain path's. Run on
 /// the memory engine and on firewood.
 fn a_block_that_evicts_nothing_keeps_the_chain_on<S: StorageEngine<K, V>>(
-    mut plain: AuthWal<K, V, LtHash, LruWrite<K>, S>,
-    mut spec: AuthWal<K, V, LtHash, LruWrite<K>, S>,
+    mut plain: RightCash<K, V, LtHash, LruWrite<K>, S>,
+    mut spec: RightCash<K, V, LtHash, LruWrite<K>, S>,
 ) {
     let reader = spec.reader();
     fill(&mut plain, &mut spec, 8);
@@ -535,19 +535,19 @@ fn speculation_on_firewood() {
     cfg.truncate = true;
     cfg.revisions = config.local.engine_window(true);
     let engine = FirewoodStorage::new(cfg).unwrap();
-    let mut wal: AuthWal<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
+    let mut cache: RightCash<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
         new_empty(config, engine, LruWrite::new(6).with_trigger(6), LtHash::new()).unwrap();
-    let reader = wal.reader();
+    let reader = cache.reader();
     let mut reference: BTreeMap<K, V> = BTreeMap::new();
     for i in 0..30u32 {
         let batch = vec![put(&format!("k{i}"), &format!("v{i}")), put("hot", &i.to_string())];
-        wal.prefetch(None, &keys(&[&format!("k{i}"), "hot", "noise"]));
+        cache.prefetch(None, &keys(&[&format!("k{i}"), "hot", "noise"]));
         for op in &batch {
             if let BatchOp::Put { key, value } = op {
                 reference.insert(key.clone(), value.clone());
             }
         }
-        wal.update(batch, None).unwrap();
+        cache.update(batch, None).unwrap();
     }
     for (key, value) in &reference {
         assert_eq!(reader.get(key).unwrap(), Some(value.clone()));
@@ -557,7 +557,7 @@ fn speculation_on_firewood() {
     assert!(stats.total_evictions > 0 && stats.occupancy <= 8);
     assert!(s.steps_built > 0 && s.speculative > 0 && s.reused_ops > 0, "{s:?}");
     assert_eq!((s.step_failures, s.fallbacks, s.worker_panics), (0, 0, 0), "{s:?}");
-    wal.close().unwrap();
+    cache.close().unwrap();
 }
 
 /// R35 on the real engine: `a_block_that_evicts_nothing_keeps_the_chain`
@@ -577,9 +577,9 @@ fn kept_chain_on_firewood() {
     let spec_config = speculating(8, 3, 3, 1, 0);
     let plain_engine = open_firewood(&dirs.0, &plain_config);
     let spec_engine = open_firewood(&dirs.1, &spec_config);
-    let plain: AuthWal<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
+    let plain: RightCash<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
         new_empty(plain_config, plain_engine, LruWrite::new(4), LtHash::new()).unwrap();
-    let spec: AuthWal<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
+    let spec: RightCash<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
         new_empty(spec_config, spec_engine, LruWrite::new(4), LtHash::new()).unwrap();
     a_block_that_evicts_nothing_keeps_the_chain_on(plain, spec);
 }

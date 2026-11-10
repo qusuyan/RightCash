@@ -31,10 +31,10 @@
 //! - The constructor forces `CacheReadStrategy::All` (a documented
 //!   deviation) so that reads through views populate the node cache; the
 //!   read-through warming that first needed it is no longer used by
-//!   auth_wal's hints (design §9.4, R26), so the setting is a milestone-2
+//!   right_cash's hints (design §9.4, R26), so the setting is a milestone-2
 //!   knob.
 //!
-//! The engine is owned by auth_wal's writer (R19): `close` takes `&mut self`
+//! The engine is owned by right_cash's writer (R19): `close` takes `&mut self`
 //! and the database slot is a plain `Option`, so the adapter has no lock of
 //! its own but the per-handle read-write lock of design §10 (e).
 
@@ -54,7 +54,7 @@ use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
 
 struct Db {
     inner: Box<dyn DynDb>,
-    // auth_wal serializes commits; readers and the speculative worker observe
+    // right_cash serializes commits; readers and the speculative worker observe
     // this counter to reject bases superseded even by a physical no-op.
     generation: AtomicU64,
 }
@@ -263,7 +263,7 @@ impl FirewoodStorage {
             .freelist_memory_limit_kb(freelist_kb)
             .cache_read_strategy(CacheReadStrategy::All)
             .build();
-        // Keep auth_wal's feature-selected engine identifier aligned with the
+        // Keep right_cash's feature-selected engine identifier aligned with the
         // runtime hash mode passed to Firewood's public open function.
         let algorithm = if cfg!(feature = "ethhash") {
             NodeHashAlgorithm::Ethereum
@@ -457,7 +457,7 @@ impl<K: Key, V: Value> StorageProposal<K, V> for Arc<FwProposal> {
         let oldest = chain.last().expect("non-empty");
         oldest.check_base_current()?;
         // Each state-changing link becomes a real revision. A later error does
-        // not roll those commits back; auth_wal handles that as a poisoned chain.
+        // not roll those commits back; right_cash handles that as a poisoned chain.
         for p in chain.iter().rev() {
             p.commit_one()?;
         }
@@ -526,7 +526,7 @@ impl FwProposal {
         // Re-base (contract item 2) to *this proposal's* root among the
         // committed revisions only (`Db::revision`, not `view`, which would
         // resolve a live proposal with the same root first and not pin the
-        // committed base; design §10 (c)); under auth_wal's serialised commits
+        // committed base; design §10 (c)); under right_cash's serialised commits
         // that is also the engine head. An emptied trie has no root hash
         // without `ethhash` and reads as absent; a lookup can fail only if the
         // window already moved past a same-root revision, and then reads

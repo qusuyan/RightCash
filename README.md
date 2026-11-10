@@ -1,4 +1,4 @@
-# auth_wal
+# right_cash
 
 An authenticated, bounded, in-memory set of recent writes that sits between the
 EVM validators (`Avax-pEVM`, `libevm`) and an authenticated storage engine
@@ -29,14 +29,14 @@ test coverage includes the policies, the set and its commitment
 oracles, the three schemes, the proposal tree and its lineage rules, the
 revision window, differential tests against a reference map and against
 the plain path, the engine contract on both backends, firewood smoke
-tests). The benchmark runs through auth_wal (`WriteSet`). Before it,
+tests). The benchmark runs through right_cash (`WriteSet`). Before it,
 milestone 0: the benchmark suite, the in-memory model engine and the
 vanilla firewood backend. First release-mode numbers (design §14, milestone
-1): on firewood's `zipf` auth_wal cuts storage ops per commit from 1000 to
+1): on firewood's `zipf` right_cash cuts storage ops per commit from 1000 to
 100 but its own set work costs about 8 ms per 1000-op batch at 10k entries,
 so throughput halves on a 50k-row database. On a populated trie
 (clarification 28, `--prefill`) the picture inverts: with the set at 10k,
-auth_wal is ahead of bare firewood from 100k rows on, by a third at 1M rows
+right_cash is ahead of bare firewood from 100k rows on, by a third at 1M rows
 on `zipf`, because firewood's per-batch cost grows with the trie and the
 set's does not (design §12.13). Growing the set itself is another matter:
 at capacity 100k the per-proposal copy costs about 28 ms per block and 3.4
@@ -168,7 +168,7 @@ supersedes the previous head. The API requires owned key/value batches.
 
 ## Initial set
 
-`AuthWal::new(config, storage, set)` consumes the complete
+`RightCash::new(config, storage, set)` consumes the complete
 `set::Snapshot<K, V, C, P>`: entries, policy state, commitment scheme and
 capacity. It derives root parameters from that set, and rejects a capacity
 mismatch with `config`. Storage must still be fresh.
@@ -183,31 +183,31 @@ The resulting set exposes no independent policy mutation.
 A populated initial set is equivalent to one initial batch: height 1 and a
 content-dependent root, with all initial entries retained in memory. An empty
 set remains height 0 with `EMPTY_ROOT`. Initial entries do not count as runtime
-writes in statistics. Use `AuthWal::recover` to restore a prior database and
+writes in statistics. Use `RightCash::recover` to restore a prior database and
 its historical policy ordering.
 
 ## Clean-shutdown persistence and recovery
 
 Set `config.local.snapshot_path = Some(path)` to enable a checkpoint on
-`AuthWal::close()`. The file contains the **latest committed** set, including
+`RightCash::close()`. The file contains the **latest committed** set, including
 tombstones, policy ages, height, capacity, metadata hash, and the corresponding
 storage and combined roots. FIFO, LRU-write, and all three commitment schemes
 support recovery. Checkpointing is disabled by default; the benchmarks retain
 their existing behavior.
 
 On startup, reopen Firewood without truncation and call
-`AuthWal::recover(config, storage, vc, policy)`. Supply matching consensus
+`RightCash::recover(config, storage, vc, policy)`. Supply matching consensus
 parameters; local settings such as the high watermark and speculation settings
 may change. For example, with the `firewood` feature:
 
 ```rust
-use auth_wal::{AuthWal, Config, Consensus, Local};
-use auth_wal::policy::LruWrite;
-use auth_wal::set::Snapshot;
-use auth_wal::storage::{FirewoodConfig, FirewoodStorage};
-use auth_wal::vc::rehash::Rehash;
+use right_cash::{RightCash, Config, Consensus, Local};
+use right_cash::policy::LruWrite;
+use right_cash::set::Snapshot;
+use right_cash::storage::{FirewoodConfig, FirewoodStorage};
+use right_cash::vc::rehash::Rehash;
 
-let snapshot_path = std::path::PathBuf::from("data/auth-wal.snapshot");
+let snapshot_path = std::path::PathBuf::from("data/right-cash.snapshot");
 let config = Config {
     consensus: Consensus { capacity: 10_000 },
     local: Local { snapshot_path: Some(snapshot_path.clone()), ..Local::default() },
@@ -215,14 +215,14 @@ let config = Config {
 std::fs::create_dir_all("data")?;
 let engine = FirewoodStorage::new(FirewoodConfig::new("data/firewood"))?;
 let policy = LruWrite::new(7_000).with_trigger(9_000);
-let mut wal: AuthWal<Vec<u8>, Vec<u8>, _, _, _> = if snapshot_path.try_exists()? {
-    AuthWal::recover(config, engine, Rehash, policy)?
+let mut cache: RightCash<Vec<u8>, Vec<u8>, _, _, _> = if snapshot_path.try_exists()? {
+    RightCash::recover(config, engine, Rehash, policy)?
 } else {
-    AuthWal::new(config, engine, Snapshot::empty(Rehash, policy, 10_000)?)?
+    RightCash::new(config, engine, Snapshot::empty(Rehash, policy, 10_000)?)?
 };
 // Propose and commit blocks normally.
-wal.close()?;
-drop(wal);
+cache.close()?;
+drop(cache);
 ```
 
 Close joins the worker, writes and syncs a temporary snapshot file, closes and
@@ -248,9 +248,9 @@ is an error, never an implicit reset.
 
 ```bash
 # Build in release mode (firewood is a path dependency; first build is slow).
-cargo build --release -p auth_wal-benchmark
+cargo build --release -p right_cash-benchmark
 
-B=target/release/auth_wal-benchmark
+B=target/release/right_cash-benchmark
 # Vanilla firewood baseline: create a 10M-row database, then run the other
 # workloads on it (create truncates; the others reopen what create left).
 $B --baseline --engine firewood --dbname /tmp/fwbench -b 10000 -n 1000 create
@@ -270,7 +270,7 @@ column. Pass `--seed <reported-seed>` to reproduce the workload, hint gaps and
 hint noise with the same configuration. Defaults follow requirement R16:
 a 10k-entry write set that evicts down to 7,000 entries; typical blocks write under 2k
 entries, so sweeps also run `-b 2000`. Without `--baseline` the workload
-runs through auth_wal. `--help` lists every knob (capacity, policy, scheme,
+runs through right_cash. `--help` lists every knob (capacity, policy, scheme,
 speculation rounds/margin, hints and hint noise, synthetic storage latency,
 seed, the per-phase breakdown).
 
@@ -279,7 +279,7 @@ seed, the per-phase breakdown).
 `scripts/run_experiments.py` runs the four experiment matrices one trial at
 a time (Zipf exponent sweep; LRU-write vs FIFO and rehash vs merkle-blake3
 on `tenkrandom` and `zipf` with precomputation, plus lthash and the sparse
-merkle on `tenkrandom`; bare firewood vs auth_wal vs auth_wal with
+merkle on `tenkrandom`; bare firewood vs right_cash vs right_cash with
 precomputation on `zipf` and `tenkrandom`). Every trial uses 1M prefilled
 rows, 2400-op blocks hinted as 30 × 80 keys with 1–5 ms gaps, 50 warm-up and
 500 measured blocks, and the seeds 101, 202 and 303, shared across targets
@@ -294,7 +294,7 @@ already recorded, so an interrupted run resumes. Experiments that run on
 several workloads prefix their trial ids with the workload
 (`zipf-lru-write-101`), so a workload added later runs into the same
 directory and lands in the same figures. Firewood v0.9.0 needs rustc
-1.94 or newer (`cargo +1.94 build --release -p auth_wal-benchmark`).
+1.94 or newer (`cargo +1.94 build --release -p right_cash-benchmark`).
 
 A fifth experiment, `--only watermarks watermarks_capacity` (run with `--out
 benchmark/results/2026-11-07-watermarks`), varies capacity, high watermark
@@ -321,7 +321,7 @@ captionless PNGs for the blog post.
 
 ## Tests and checks
 
-Library tests are grouped under [`src/tests/`](src/tests/mod.rs): `wal`,
+Library tests are grouped under [`src/tests/`](src/tests/mod.rs): `cache`,
 `policy`, `speculation`, `faults`, `persist`, `storage`, and `encodings`.
 Shared fixtures live in `src/tests/common.rs`. These are unit tests because
 they also inspect crate-private snapshots, storage views, and worker state;
@@ -329,16 +329,16 @@ tests of private implementation helpers stay inline beside those helpers.
 
 ```bash
 # Compile all library tests, without running the suite.
-cargo test -p auth_wal --lib --no-default-features --no-run
-cargo test -p auth_wal --lib --all-features --no-run
+cargo test -p right_cash --lib --no-default-features --no-run
+cargo test -p right_cash --lib --all-features --no-run
 # Run just persistence/recovery tests, including the private file-write test.
-cargo test -p auth_wal --lib --features firewood checkpoint_
+cargo test -p right_cash --lib --features firewood checkpoint_
 
 cargo check --workspace --all-features            # lib + benchmark
-cargo check -p auth_wal --features firewood        # firewood backend (path dependency on ../firewood); -p: the benchmark enables it
+cargo check -p right_cash --features firewood      # firewood backend (path dependency on ../firewood); -p: the benchmark enables it
 cargo test  --workspace --all-features             # the whole battery (firewood contract and smoke tests included)
 cargo clippy --workspace --all-features --all-targets
-cargo doc -p auth_wal --no-deps --all-features
+cargo doc -p right_cash --no-deps --all-features
 cargo fmt --all -- --check                        # rustfmt.toml: max_width = 120
 cargo build --release --workspace                 # the benchmark binary; the staticlib for the Go shim arrives with milestone 4
 ```

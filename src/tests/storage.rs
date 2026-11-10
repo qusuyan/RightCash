@@ -10,7 +10,7 @@ type K = Vec<u8>;
 type V = Vec<u8>;
 
 /// Reads the committed state through the engine's `head()` handle (contract
-/// item 7): the only read path auth_wal uses.
+/// item 7): the only read path right_cash uses.
 fn get<S: StorageEngine<K, V>>(s: &S, key: &str) -> Option<V> {
     s.head().unwrap().get(&k(key)).unwrap()
 }

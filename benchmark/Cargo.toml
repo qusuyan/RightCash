@@ -1,17 +1,17 @@
 [package]
-name = "auth_wal-benchmark"
+name = "right_cash-benchmark"
 version = "0.1.0"
 edition = "2024"
-description = "firewood-style workloads (create, tenkrandom, zipf, single) against auth_wal and bare storage engines (design §11)"
+description = "firewood-style workloads (create, tenkrandom, zipf, single) against right_cash and bare storage engines (design §11)"
 
 [features]
 default = ["firewood"]
 # Vanilla firewood as a target (design §11 baseline, R13).
-firewood = ["auth_wal/firewood"]
-ethhash = ["auth_wal/ethhash"]
+firewood = ["right_cash/firewood"]
+ethhash = ["right_cash/ethhash"]
 
 [dependencies]
-auth_wal = { path = ".." }
+right_cash = { path = ".." }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 rand = "0.10"

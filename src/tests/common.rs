@@ -4,7 +4,7 @@ use crate::policy::EvictionPolicy;
 use crate::storage::{MemoryConfig, MemoryStorage, StorageEngine};
 use crate::types::{BatchOp, Hash};
 use crate::vc::VectorCommitment;
-use crate::{AuthWal, Config, Consensus, Local};
+use crate::{Config, Consensus, Local, RightCash};
 
 pub(super) type K = Vec<u8>;
 pub(super) type V = Vec<u8>;
@@ -56,7 +56,7 @@ impl TempDir {
     pub(crate) fn new(tag: &str) -> Self {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "auth_wal-{tag}-{}-{}",
+            "right_cash-{tag}-{}-{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -78,7 +78,7 @@ impl Drop for TempDir {
     }
 }
 
-pub(super) type Wal<C, P> = AuthWal<K, V, C, P, MemoryStorage<K, V>>;
+pub(super) type Cache<C, P> = RightCash<K, V, C, P, MemoryStorage<K, V>>;
 
 // Empty-start fixtures keep their policy/scheme convenience at the test boundary.
 pub(super) fn new_empty<C, P, S>(
@@ -86,14 +86,14 @@ pub(super) fn new_empty<C, P, S>(
     storage: S,
     policy: P,
     vc: C,
-) -> crate::types::Result<AuthWal<K, V, C, P, S>>
+) -> crate::types::Result<RightCash<K, V, C, P, S>>
 where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
     let set = crate::set::Snapshot::genesis(vc, policy, config.consensus.capacity);
-    AuthWal::new(config, storage, set)
+    RightCash::new(config, storage, set)
 }
 
 pub(super) fn config(capacity: usize, revisions: usize) -> Config {
@@ -106,7 +106,7 @@ pub(super) fn config(capacity: usize, revisions: usize) -> Config {
     }
 }
 
-pub(super) fn open<C, P>(capacity: usize, revisions: usize, policy: P, vc: C) -> Wal<C, P>
+pub(super) fn open<C, P>(capacity: usize, revisions: usize, policy: P, vc: C) -> Cache<C, P>
 where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
@@ -118,12 +118,12 @@ where
     new_empty(config(capacity, revisions), engine, policy, vc).unwrap()
 }
 
-pub(super) fn get<C, P>(wal: &Wal<C, P>, key: &str) -> Option<V>
+pub(super) fn get<C, P>(cache: &Cache<C, P>, key: &str) -> Option<V>
 where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    wal.reader().get(&k(key)).unwrap()
+    cache.reader().get(&k(key)).unwrap()
 }
 
 pub(super) fn speculating(capacity: usize, revisions: usize, rounds: u32, min_step: usize, margin: usize) -> Config {
@@ -140,7 +140,7 @@ pub(super) fn speculating(capacity: usize, revisions: usize, rounds: u32, min_st
     }
 }
 
-pub(super) fn open_with<C, P>(config: Config, policy: P, vc: C) -> Wal<C, P>
+pub(super) fn open_with<C, P>(config: Config, policy: P, vc: C) -> Cache<C, P>
 where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
@@ -154,7 +154,7 @@ where
 
 /// `k0..kn` with value "0" on both instances: the set every scenario starts
 /// from.
-pub(super) fn fill<C, P, S>(plain: &mut AuthWal<K, V, C, P, S>, spec: &mut AuthWal<K, V, C, P, S>, n: usize)
+pub(super) fn fill<C, P, S>(plain: &mut RightCash<K, V, C, P, S>, spec: &mut RightCash<K, V, C, P, S>, n: usize)
 where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
@@ -170,8 +170,8 @@ pub(super) fn fill_batch(n: usize) -> Vec<BatchOp<K, V>> {
 
 /// The same block on both instances; their roots must agree.
 pub(super) fn agree<C, P, S>(
-    plain: &mut AuthWal<K, V, C, P, S>,
-    spec: &mut AuthWal<K, V, C, P, S>,
+    plain: &mut RightCash<K, V, C, P, S>,
+    spec: &mut RightCash<K, V, C, P, S>,
     batch: Vec<BatchOp<K, V>>,
 ) -> Hash
 where

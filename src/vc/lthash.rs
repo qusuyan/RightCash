@@ -8,7 +8,7 @@ use crate::set::EntryRef;
 use crate::types::{Digest, Key};
 use crate::vc::{VectorCommitment, item_fields};
 
-const TAG: &str = "auth_wal/lthash";
+const TAG: &str = "right_cash/lthash";
 
 /// Parameter-free scheme; the state is the accumulator of the set's items.
 #[derive(Clone)]

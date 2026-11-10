@@ -1,4 +1,4 @@
-//! Clean-shutdown persistence and recovery through the AuthWal API.
+//! Clean-shutdown persistence and recovery through the RightCash API.
 
 use super::common::{del, k, put};
 use crate::policy::EvictionPolicy;
@@ -9,11 +9,11 @@ use crate::types::BatchOp;
 use crate::types::{EMPTY_ROOT, Error, Hash, Result};
 use crate::vc::VectorCommitment;
 use crate::vc::{lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
-use crate::{AuthWal, Config, Consensus, Local};
+use crate::{Config, Consensus, Local, RightCash};
 use std::fs;
 use std::path::Path;
 
-type MemWal<C = Rehash, P = LruWrite<Vec<u8>>> = AuthWal<Vec<u8>, Vec<u8>, C, P, MemoryStorage<Vec<u8>, Vec<u8>>>;
+type MemWal<C = Rehash, P = LruWrite<Vec<u8>>> = RightCash<Vec<u8>, Vec<u8>, C, P, MemoryStorage<Vec<u8>, Vec<u8>>>;
 
 fn config(path: &Path, capacity: usize, speculate: bool) -> Config {
     Config {
@@ -40,7 +40,7 @@ fn roundtrip<C: VectorCommitment<Vec<u8>>, P: EvictionPolicy<Vec<u8>>>(vc: C, po
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(&dir.path().join("snapshot"), 6, true);
     let make_set = || Snapshot::empty(vc.clone(), policy.clone(), 6).unwrap();
-    let mut wal = MemWal::new(cfg.clone(), memory(), make_set()).unwrap();
+    let mut cache = MemWal::new(cfg.clone(), memory(), make_set()).unwrap();
     let mut plain_cfg = cfg.clone();
     plain_cfg.local.snapshot_path = None;
     plain_cfg.local.speculate = false;
@@ -52,25 +52,25 @@ fn roundtrip<C: VectorCommitment<Vec<u8>>, P: EvictionPolicy<Vec<u8>>>(vc: C, po
     ];
     let mut first_root = EMPTY_ROOT;
     for batch in batches {
-        wal.prefetch(None, &[k("false hint")]);
-        let root = wal.update(batch.clone(), Some(b"block metadata")).unwrap();
+        cache.prefetch(None, &[k("false hint")]);
+        let root = cache.update(batch.clone(), Some(b"block metadata")).unwrap();
         assert_eq!(root, control.update(batch, Some(b"block metadata")).unwrap());
         if first_root == EMPTY_ROOT {
             first_root = root;
         }
     }
-    let saved_root = wal.reader().root();
-    let discarded = wal.propose(None, vec![put("a", "uncommitted")], None).unwrap();
-    wal.close().unwrap();
+    let saved_root = cache.reader().root();
+    let discarded = cache.propose(None, vec![put("a", "uncommitted")], None).unwrap();
+    cache.close().unwrap();
     let original_file = fs::read(cfg.local.snapshot_path.as_ref().unwrap()).unwrap();
-    wal.close().unwrap();
+    cache.close().unwrap();
     assert_eq!(
         fs::read(cfg.local.snapshot_path.as_ref().unwrap()).unwrap(),
         original_file
     );
     assert_eq!(discarded.get(&k("a")).unwrap(), Some(k("uncommitted")));
     drop(discarded);
-    drop(wal);
+    drop(cache);
 
     // Local settings can change across restarts; consensus state cannot.
     cfg.local.speculation_min_step = 256;
@@ -129,24 +129,24 @@ fn checkpoint_recovery_preserves_future_roots_for_all_schemes_and_policies() {
 fn checkpoint_genesis_and_fixed_size_bytes_recover() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(&dir.path().join("snapshot"), 3, false);
-    type Wal = AuthWal<[u8; 2], [u8; 3], Rehash, Fifo<[u8; 2]>, MemoryStorage<[u8; 2], [u8; 3]>>;
-    let mut wal = Wal::new(
+    type Cache = RightCash<[u8; 2], [u8; 3], Rehash, Fifo<[u8; 2]>, MemoryStorage<[u8; 2], [u8; 3]>>;
+    let mut cache = Cache::new(
         cfg.clone(),
         MemoryStorage::new(MemoryConfig::default()),
         Snapshot::empty(Rehash, Fifo::new(2), 3).unwrap(),
     )
     .unwrap();
-    wal.close().unwrap();
-    drop(wal);
-    let mut wal = Wal::recover(
+    cache.close().unwrap();
+    drop(cache);
+    let mut cache = Cache::recover(
         cfg.clone(),
         MemoryStorage::new(MemoryConfig::default()),
         Rehash,
         Fifo::new(2),
     )
     .unwrap();
-    assert_eq!(wal.reader().root(), EMPTY_ROOT);
-    let root = wal
+    assert_eq!(cache.reader().root(), EMPTY_ROOT);
+    let root = cache
         .update(
             vec![BatchOp::Put {
                 key: [1, 2],
@@ -155,19 +155,19 @@ fn checkpoint_genesis_and_fixed_size_bytes_recover() {
             Some(&[]),
         )
         .unwrap();
-    wal.close().unwrap();
-    drop(wal);
-    let mut wal = Wal::recover(
+    cache.close().unwrap();
+    drop(cache);
+    let mut cache = Cache::recover(
         cfg.clone(),
         MemoryStorage::new(MemoryConfig::default()),
         Rehash,
         Fifo::new(2),
     )
     .unwrap();
-    assert_eq!(wal.reader().root(), root);
-    assert_eq!(wal.reader().get(&[1, 2]).unwrap(), Some([3, 4, 5]));
-    wal.close().unwrap();
-    type WrongKey = AuthWal<[u8; 3], [u8; 3], Rehash, Fifo<[u8; 3]>, MemoryStorage<[u8; 3], [u8; 3]>>;
+    assert_eq!(cache.reader().root(), root);
+    assert_eq!(cache.reader().get(&[1, 2]).unwrap(), Some([3, 4, 5]));
+    cache.close().unwrap();
+    type WrongKey = RightCash<[u8; 3], [u8; 3], Rehash, Fifo<[u8; 3]>, MemoryStorage<[u8; 3], [u8; 3]>>;
     assert!(matches!(
         WrongKey::recover(
             cfg.clone(),
@@ -177,7 +177,7 @@ fn checkpoint_genesis_and_fixed_size_bytes_recover() {
         ),
         Err(Error::InvalidSnapshot(_))
     ));
-    type WrongValue = AuthWal<[u8; 2], [u8; 4], Rehash, Fifo<[u8; 2]>, MemoryStorage<[u8; 2], [u8; 4]>>;
+    type WrongValue = RightCash<[u8; 2], [u8; 4], Rehash, Fifo<[u8; 2]>, MemoryStorage<[u8; 2], [u8; 4]>>;
     assert!(matches!(
         WrongValue::recover(cfg, MemoryStorage::new(MemoryConfig::default()), Rehash, Fifo::new(2)),
         Err(Error::InvalidSnapshot(_))
@@ -193,8 +193,8 @@ fn saved_file(path: &Path) -> Config {
         [(k("a"), Entry::Value(k("A"))), (k("b"), Entry::Tombstone)],
     )
     .unwrap();
-    let mut wal = MemWal::new(cfg.clone(), memory(), set).unwrap();
-    wal.close().unwrap();
+    let mut cache = MemWal::new(cfg.clone(), memory(), set).unwrap();
+    cache.close().unwrap();
     cfg
 }
 
@@ -247,8 +247,8 @@ fn checkpoint_rejects_missing_files_and_mismatched_configuration_or_storage() {
         Err(Error::InvalidSnapshot(_))
     ));
     // The trigger is local and can be changed freely.
-    let mut wal = MemWal::recover(cfg, memory(), Rehash, LruWrite::new(2).with_trigger(2)).unwrap();
-    wal.close().unwrap();
+    let mut cache = MemWal::recover(cfg, memory(), Rehash, LruWrite::new(2).with_trigger(2)).unwrap();
+    cache.close().unwrap();
 }
 
 fn rechecksum(bytes: &mut [u8]) {
@@ -335,7 +335,7 @@ fn checkpoint_failed_engine_close_cannot_publish_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("snapshot");
     let cfg = config(&path, 3, false);
-    let mut wal = AuthWal::new(
+    let mut cache = RightCash::new(
         cfg,
         FailingClose {
             inner: memory(),
@@ -345,8 +345,8 @@ fn checkpoint_failed_engine_close_cannot_publish_on_retry() {
     )
     .unwrap();
     fs::write(&path, b"previous checkpoint").unwrap();
-    assert!(matches!(wal.close(), Err(Error::Storage(_))));
-    assert!(matches!(wal.close(), Err(Error::Poisoned(_))));
+    assert!(matches!(cache.close(), Err(Error::Storage(_))));
+    assert!(matches!(cache.close(), Err(Error::Poisoned(_))));
     assert_eq!(fs::read(&path).unwrap(), b"previous checkpoint");
 }
 
@@ -356,19 +356,20 @@ fn checkpoint_close_retries_io_and_active_handle_failures() {
     let parent = dir.path().join("parent");
     let path = parent.join("snapshot");
     let cfg = config(&path, 3, false);
-    let mut wal = MemWal::new(cfg, memory(), Snapshot::empty(Rehash, LruWrite::new(1), 3).unwrap()).unwrap();
-    wal.update(vec![put("a", "A"), put("b", "B"), put("c", "C")], None)
+    let mut cache = MemWal::new(cfg, memory(), Snapshot::empty(Rehash, LruWrite::new(1), 3).unwrap()).unwrap();
+    cache
+        .update(vec![put("a", "A"), put("b", "B"), put("c", "C")], None)
         .unwrap();
-    let outstanding = wal.propose(None, vec![put("d", "D")], None).unwrap();
+    let outstanding = cache.propose(None, vec![put("d", "D")], None).unwrap();
     fs::write(&parent, b"not a directory").unwrap();
-    assert!(matches!(wal.close(), Err(Error::SnapshotIo(_))));
+    assert!(matches!(cache.close(), Err(Error::SnapshotIo(_))));
     fs::remove_file(&parent).unwrap();
-    assert!(matches!(wal.close(), Err(Error::ActiveHandles)));
+    assert!(matches!(cache.close(), Err(Error::ActiveHandles)));
     assert!(!path.exists());
     drop(outstanding);
-    wal.close().unwrap();
+    cache.close().unwrap();
     assert!(path.is_file());
-    assert!(matches!(wal.update(vec![], None), Err(Error::Closed)));
+    assert!(matches!(cache.update(vec![], None), Err(Error::Closed)));
 }
 
 #[cfg(feature = "firewood")]
@@ -379,7 +380,7 @@ fn firewood_roundtrip<P: EvictionPolicy<Vec<u8>>>(policy: P) {
     let mut engine_config = FirewoodConfig::new(dir.path().join("firewood"));
     engine_config.revisions = 12;
     let open_engine = || FirewoodStorage::new(engine_config.clone()).unwrap();
-    let mut wal = AuthWal::<Vec<u8>, Vec<u8>, _, _, _>::new(
+    let mut cache = RightCash::<Vec<u8>, Vec<u8>, _, _, _>::new(
         cfg.clone(),
         open_engine(),
         Snapshot::empty(Rehash, policy.clone(), 3).unwrap(),
@@ -391,32 +392,32 @@ fn firewood_roundtrip<P: EvictionPolicy<Vec<u8>>>(policy: P) {
         vec![put("d", "new D")],
     ] {
         let keys: Vec<_> = batch.iter().filter_map(|op| op.key().cloned()).collect();
-        wal.prefetch(None, &keys);
-        wal.update(batch, Some(b"metadata survives restart")).unwrap();
+        cache.prefetch(None, &keys);
+        cache.update(batch, Some(b"metadata survives restart")).unwrap();
     }
-    assert!(wal.reader().stats().total_evictions > 0);
-    let root = wal.reader().root();
-    wal.close().unwrap();
-    drop(wal); // Release pinned Firewood views before reopening its file.
-    let mut wal =
-        AuthWal::<Vec<u8>, Vec<u8>, _, _, _>::recover(cfg.clone(), open_engine(), Rehash, policy.clone()).unwrap();
-    assert_eq!(wal.reader().root(), root);
-    assert_eq!(wal.reader().get(&k("a")).unwrap(), None); // Tombstone masks stored A.
-    assert_eq!(wal.reader().get(&k("b")).unwrap(), Some(k("new B")));
-    assert_eq!(wal.reader().get(&k("c")).unwrap(), Some(k("C"))); // Evicted, read from disk.
-    assert_eq!(wal.reader().get(&k("d")).unwrap(), Some(k("new D")));
-    assert_eq!(wal.reader().stats().height, 3);
-    wal.prefetch(None, &[k("e"), k("f")]);
-    let next = wal.update(vec![put("e", "E"), put("f", "F")], None).unwrap();
-    wal.close().unwrap();
-    drop(wal);
-    let mut wal = AuthWal::<Vec<u8>, Vec<u8>, _, _, _>::recover(cfg, open_engine(), Rehash, policy).unwrap();
-    assert_eq!(wal.reader().root(), next);
-    assert_eq!(wal.reader().stats().height, 4);
-    assert_eq!(wal.reader().get(&k("a")).unwrap(), None);
-    assert_eq!(wal.reader().get(&k("e")).unwrap(), Some(k("E")));
-    assert_eq!(wal.reader().get(&k("f")).unwrap(), Some(k("F")));
-    wal.close().unwrap();
+    assert!(cache.reader().stats().total_evictions > 0);
+    let root = cache.reader().root();
+    cache.close().unwrap();
+    drop(cache); // Release pinned Firewood views before reopening its file.
+    let mut cache =
+        RightCash::<Vec<u8>, Vec<u8>, _, _, _>::recover(cfg.clone(), open_engine(), Rehash, policy.clone()).unwrap();
+    assert_eq!(cache.reader().root(), root);
+    assert_eq!(cache.reader().get(&k("a")).unwrap(), None); // Tombstone masks stored A.
+    assert_eq!(cache.reader().get(&k("b")).unwrap(), Some(k("new B")));
+    assert_eq!(cache.reader().get(&k("c")).unwrap(), Some(k("C"))); // Evicted, read from disk.
+    assert_eq!(cache.reader().get(&k("d")).unwrap(), Some(k("new D")));
+    assert_eq!(cache.reader().stats().height, 3);
+    cache.prefetch(None, &[k("e"), k("f")]);
+    let next = cache.update(vec![put("e", "E"), put("f", "F")], None).unwrap();
+    cache.close().unwrap();
+    drop(cache);
+    let mut cache = RightCash::<Vec<u8>, Vec<u8>, _, _, _>::recover(cfg, open_engine(), Rehash, policy).unwrap();
+    assert_eq!(cache.reader().root(), next);
+    assert_eq!(cache.reader().stats().height, 4);
+    assert_eq!(cache.reader().get(&k("a")).unwrap(), None);
+    assert_eq!(cache.reader().get(&k("e")).unwrap(), Some(k("E")));
+    assert_eq!(cache.reader().get(&k("f")).unwrap(), Some(k("F")));
+    cache.close().unwrap();
 }
 
 #[cfg(feature = "firewood")]

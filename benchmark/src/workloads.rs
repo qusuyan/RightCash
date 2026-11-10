@@ -4,10 +4,10 @@
 
 use std::error::Error;
 
-use auth_wal::types::BatchOp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Zipf};
+use right_cash::types::BatchOp;
 use sha2::{Digest, Sha256};
 
 use crate::report::Measurements;

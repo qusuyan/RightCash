@@ -144,33 +144,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "auth_wal"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "chacha20",
- "firewood",
- "firewood-storage",
- "im",
- "log",
- "parking_lot",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "auth_wal-benchmark"
-version = "0.1.0"
-dependencies = [
- "auth_wal",
- "clap",
- "rand",
- "rand_distr",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1346,6 +1319,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "right_cash"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20",
+ "firewood",
+ "firewood-storage",
+ "im",
+ "log",
+ "parking_lot",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "right_cash-benchmark"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rand",
+ "rand_distr",
+ "right_cash",
+ "sha2 0.10.9",
 ]
 
 [[package]]

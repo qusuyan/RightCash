@@ -6,7 +6,7 @@ use crate::set::Entry;
 use crate::storage::{MemoryConfig, MemoryStorage, StorageProposal};
 use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash};
 use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
-use crate::{AuthWal, Config};
+use crate::{Config, RightCash};
 use std::collections::BTreeMap;
 
 fn suite<C, P>(policy: impl Fn() -> P, vc: impl Fn() -> C)
@@ -30,8 +30,8 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let wal = open(4, 3, policy, vc);
-    let reader = wal.reader();
+    let cache = open(4, 3, policy, vc);
+    let reader = cache.reader();
     assert_eq!(reader.root(), EMPTY_ROOT);
     assert_eq!(reader.get(&k("a")).unwrap(), None);
     // Genesis resolves while it is in the ring (design §3, §8).
@@ -46,25 +46,25 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(4, 3, policy, vc);
-    let reader = wal.reader();
-    let p1 = wal.propose(None, vec![put("a", "1"), put("b", "2")], None).unwrap();
+    let mut cache = open(4, 3, policy, vc);
+    let reader = cache.reader();
+    let p1 = cache.propose(None, vec![put("a", "1"), put("b", "2")], None).unwrap();
     let r1 = p1.root();
     assert_ne!(r1, EMPTY_ROOT);
     // A live proposal reads its own set and resolves by root (design §5, §8).
     assert_eq!(p1.get(&k("a")).unwrap(), Some(k("1")));
     assert_eq!(reader.get(&k("a")).unwrap(), None);
     assert_eq!(reader.revision(r1).unwrap().get(&k("b")).unwrap(), Some(k("2")));
-    assert_eq!(wal.commit(p1).unwrap(), r1);
+    assert_eq!(cache.commit(p1).unwrap(), r1);
     assert_eq!(reader.root(), r1);
-    assert_eq!(get(&wal, "a"), Some(k("1")));
+    assert_eq!(get(&cache, "a"), Some(k("1")));
     // A rewrite and a delete: in-place update, tombstone reads as absent, a
     // put over the tombstone is a write to a present key.
-    let r2 = wal.update(vec![put("a", "3"), del("b"), del("c")], None).unwrap();
+    let r2 = cache.update(vec![put("a", "3"), del("b"), del("c")], None).unwrap();
     assert_ne!(r2, r1);
-    assert_eq!(get(&wal, "a"), Some(k("3")));
-    assert_eq!(get(&wal, "b"), None);
-    assert_eq!(get(&wal, "c"), None);
+    assert_eq!(get(&cache, "a"), Some(k("3")));
+    assert_eq!(get(&cache, "b"), None);
+    assert_eq!(get(&cache, "c"), None);
     let stats = reader.stats();
     assert_eq!(stats.height, 2);
     assert_eq!(stats.occupancy, 3);
@@ -72,12 +72,12 @@ where
     assert_eq!(stats.in_place_updates, 1);
     assert_eq!(stats.total_evictions, 0);
     assert_eq!(stats.storage_proposals, 0);
-    wal.update(vec![put("c", "4")], None).unwrap();
+    cache.update(vec![put("c", "4")], None).unwrap();
     assert_eq!(reader.stats().in_place_updates, 2);
-    assert_eq!(get(&wal, "c"), Some(k("4")));
+    assert_eq!(get(&cache, "c"), Some(k("4")));
     // An empty block still gets a new root (height is in the preimage).
     let r3 = reader.root();
-    let r4 = wal.update(vec![], None).unwrap();
+    let r4 = cache.update(vec![], None).unwrap();
     assert_ne!(r3, r4);
 }
 
@@ -87,12 +87,13 @@ where
     P: EvictionPolicy<K>,
 {
     // Capacity 4, watermark 2: the fifth entry evicts two.
-    let mut wal = open(4, 3, policy, vc);
-    let reader = wal.reader();
-    wal.update(vec![put("a", "1"), put("b", "2"), put("c", "3"), put("d", "4")], None)
+    let mut cache = open(4, 3, policy, vc);
+    let reader = cache.reader();
+    cache
+        .update(vec![put("a", "1"), put("b", "2"), put("c", "3"), put("d", "4")], None)
         .unwrap();
     assert_eq!(reader.stats().occupancy, 4);
-    let p = wal.propose(None, vec![put("e", "5"), del("f")], None).unwrap();
+    let p = cache.propose(None, vec![put("e", "5"), del("f")], None).unwrap();
     // Six entries: the policy evicts down to two; the node owns a storage
     // proposal and reads through it for the evicted keys.
     let expected = [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")];
@@ -100,22 +101,22 @@ where
         assert_eq!(p.get(&k(key)).unwrap(), Some(k(value)));
     }
     assert_eq!(p.get(&k("f")).unwrap(), None);
-    wal.commit(p).unwrap();
+    cache.commit(p).unwrap();
     let stats = reader.stats();
     assert_eq!(stats.occupancy, 2);
     assert_eq!(stats.total_evictions, 4);
     assert_eq!(stats.storage_proposals, 1);
     assert_eq!(stats.total_storage_ops, 4);
     for (key, value) in expected {
-        assert_eq!(get(&wal, key), Some(k(value)));
+        assert_eq!(get(&cache, key), Some(k(value)));
     }
-    assert_eq!(get(&wal, "f"), None);
+    assert_eq!(get(&cache, "f"), None);
     // The committed state stays readable through a retained revision after
     // further commits, exactly as it was.
     let r = reader.root();
-    wal.update(vec![put("a", "9")], None).unwrap();
+    cache.update(vec![put("a", "9")], None).unwrap();
     assert_eq!(reader.revision(r).unwrap().get(&k("a")).unwrap(), Some(k("1")));
-    assert_eq!(get(&wal, "a"), Some(k("9")));
+    assert_eq!(get(&cache, "a"), Some(k("9")));
 }
 
 fn revision_window<C, P>(policy: P, vc: C)
@@ -123,11 +124,11 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(4, 3, policy, vc);
-    let reader = wal.reader();
+    let mut cache = open(4, 3, policy, vc);
+    let reader = cache.reader();
     let mut roots = vec![EMPTY_ROOT];
     for i in 0..5 {
-        roots.push(wal.update(vec![put("k", &i.to_string())], None).unwrap());
+        roots.push(cache.update(vec![put("k", &i.to_string())], None).unwrap());
     }
     // K = 3: the last three committed roots resolve, the older ones do not.
     for root in &roots[..3] {
@@ -138,7 +139,7 @@ where
         assert_eq!(handle.get(&k("k")).unwrap(), Some(k(&(i + 2).to_string())));
     }
     // A live proposal resolves while its handle is held, not after.
-    let p = wal.propose(None, vec![put("x", "1")], None).unwrap();
+    let p = cache.propose(None, vec![put("x", "1")], None).unwrap();
     let live = p.root();
     assert_eq!(reader.revision(live).unwrap().get(&k("x")).unwrap(), Some(k("1")));
     drop(p);
@@ -150,32 +151,32 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(4, 3, policy, vc);
+    let mut cache = open(4, 3, policy, vc);
     // A deeper pipelined node: commit the parent first.
-    let p1 = wal.propose(None, vec![put("a", "1")], None).unwrap();
-    let p2 = wal.propose(Some(&p1), vec![put("b", "2")], None).unwrap();
+    let p1 = cache.propose(None, vec![put("a", "1")], None).unwrap();
+    let p2 = cache.propose(Some(&p1), vec![put("b", "2")], None).unwrap();
     assert_eq!(p2.get(&k("a")).unwrap(), Some(k("1")));
-    assert!(matches!(wal.commit(p2), Err(Error::ParentUncommitted)));
-    let p2 = wal.propose(Some(&p1), vec![put("b", "2")], None).unwrap();
-    wal.commit(p1).unwrap();
-    wal.commit(p2).unwrap();
-    assert_eq!(get(&wal, "b"), Some(k("2")));
+    assert!(matches!(cache.commit(p2), Err(Error::ParentUncommitted)));
+    let p2 = cache.propose(Some(&p1), vec![put("b", "2")], None).unwrap();
+    cache.commit(p1).unwrap();
+    cache.commit(p2).unwrap();
+    assert_eq!(get(&cache, "b"), Some(k("2")));
     // An orphan: the parent dropped uncommitted.
-    let p3 = wal.propose(None, vec![put("c", "3")], None).unwrap();
-    let p4 = wal.propose(Some(&p3), vec![put("d", "4")], None).unwrap();
+    let p3 = cache.propose(None, vec![put("c", "3")], None).unwrap();
+    let p4 = cache.propose(Some(&p3), vec![put("d", "4")], None).unwrap();
     drop(p3);
-    assert!(matches!(wal.commit(p4), Err(Error::ProposalOrphaned)));
+    assert!(matches!(cache.commit(p4), Err(Error::ProposalOrphaned)));
     // A twin of the head: that state is committed already.
-    let p5 = wal.propose(None, vec![put("e", "5")], None).unwrap();
-    let p5b = wal.propose(None, vec![put("e", "5")], None).unwrap();
+    let p5 = cache.propose(None, vec![put("e", "5")], None).unwrap();
+    let p5b = cache.propose(None, vec![put("e", "5")], None).unwrap();
     assert_eq!(p5.root(), p5b.root());
-    wal.commit(p5).unwrap();
-    assert!(matches!(wal.commit(p5b), Err(Error::ProposalConsumed)));
+    cache.commit(p5).unwrap();
+    assert!(matches!(cache.commit(p5b), Err(Error::ProposalConsumed)));
     // Proposing on a handle whose root is the head's builds on the head.
-    let head = wal.reader().latest_revision();
-    let p6 = wal.propose(Some(&head), vec![put("f", "6")], None).unwrap();
-    wal.commit(p6).unwrap();
-    assert_eq!(get(&wal, "f"), Some(k("6")));
+    let head = cache.reader().latest_revision();
+    let p6 = cache.propose(Some(&head), vec![put("f", "6")], None).unwrap();
+    cache.commit(p6).unwrap();
+    assert_eq!(get(&cache, "f"), Some(k("6")));
 }
 
 fn metadata_and_equal_roots<C, P>(policy: P, vc: C)
@@ -183,22 +184,22 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(4, 3, policy, vc);
+    let mut cache = open(4, 3, policy, vc);
     let batch = || vec![put("a", "1")];
-    let none = wal.propose(None, batch(), None).unwrap().root();
-    let empty = wal.propose(None, batch(), Some(b"")).unwrap().root();
-    let some = wal.propose(None, batch(), Some(b"m")).unwrap().root();
-    let same = wal.propose(None, batch(), Some(b"m")).unwrap().root();
+    let none = cache.propose(None, batch(), None).unwrap().root();
+    let empty = cache.propose(None, batch(), Some(b"")).unwrap().root();
+    let some = cache.propose(None, batch(), Some(b"m")).unwrap().root();
+    let same = cache.propose(None, batch(), Some(b"m")).unwrap().root();
     assert_ne!(none, empty);
     assert_ne!(empty, some);
     assert_eq!(some, same);
     // The equal-root property (design §7.3): a child proposed on the
     // committed node and on a live twin of it gets one root.
-    let p1 = wal.propose(None, batch(), None).unwrap();
-    let twin = wal.propose(None, batch(), None).unwrap();
-    wal.commit(p1).unwrap();
-    let on_head = wal.propose(None, vec![put("b", "2")], None).unwrap();
-    let on_twin = wal.propose(Some(&twin), vec![put("b", "2")], None).unwrap();
+    let p1 = cache.propose(None, batch(), None).unwrap();
+    let twin = cache.propose(None, batch(), None).unwrap();
+    cache.commit(p1).unwrap();
+    let on_head = cache.propose(None, vec![put("b", "2")], None).unwrap();
+    let on_twin = cache.propose(Some(&twin), vec![put("b", "2")], None).unwrap();
     assert_eq!(on_head.root(), on_twin.root());
 }
 
@@ -233,11 +234,11 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(4, 3, policy, vc);
-    let reader = wal.reader();
-    wal.update(vec![put("a", "1")], None).unwrap();
+    let mut cache = open(4, 3, policy, vc);
+    let reader = cache.reader();
+    cache.update(vec![put("a", "1")], None).unwrap();
     assert!(matches!(
-        wal.propose(
+        cache.propose(
             None,
             vec![BatchOp::PrefixDelete {
                 prefix: Box::new([0u8])
@@ -246,9 +247,9 @@ where
         ),
         Err(Error::PrefixDeleteUnsupported)
     ));
-    wal.close().unwrap();
-    wal.close().unwrap();
-    assert!(matches!(wal.propose(None, vec![], None), Err(Error::Closed)));
+    cache.close().unwrap();
+    cache.close().unwrap();
+    assert!(matches!(cache.propose(None, vec![], None), Err(Error::Closed)));
     // Reads keep working after close (design §3).
     assert_eq!(reader.get(&k("a")).unwrap(), Some(k("1")));
     assert_ne!(reader.root(), EMPTY_ROOT);
@@ -261,8 +262,8 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    let mut wal = open(16, 4, policy, vc);
-    let reader = wal.reader();
+    let mut cache = open(16, 4, policy, vc);
+    let reader = cache.reader();
     let mut reference: BTreeMap<K, V> = BTreeMap::new();
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut next = || rng.next();
@@ -283,7 +284,7 @@ where
                 pending.insert(key, Some(value));
             }
         }
-        let proposal = wal.propose(None, batch, None).unwrap();
+        let proposal = cache.propose(None, batch, None).unwrap();
         for (key, value) in pending {
             match value {
                 Some(value) => {
@@ -298,7 +299,7 @@ where
             let key = k(&format!("k{i}"));
             assert_eq!(proposal.get(&key).unwrap(), reference.get(&key).cloned());
         }
-        wal.commit(proposal).unwrap();
+        cache.commit(proposal).unwrap();
         for i in 0..40 {
             let key = k(&format!("k{i}"));
             assert_eq!(reader.get(&key).unwrap(), reference.get(&key).cloned());
@@ -354,10 +355,10 @@ fn lru_write_and_fifo_differ_on_a_same_value_rewrite() {
     // from an empty block's; under fifo the two blocks share a root (design
     // §6.1 tests, §7.3).
     fn roots<P: EvictionPolicy<K>>(policy: impl Fn() -> P) -> (Hash, Hash) {
-        let mut wal = open(4, 3, policy(), LtHash::new());
-        wal.update(vec![put("a", "1")], None).unwrap();
-        let rewrite = wal.propose(None, vec![put("a", "1")], None).unwrap().root();
-        let empty = wal.propose(None, vec![], None).unwrap().root();
+        let mut cache = open(4, 3, policy(), LtHash::new());
+        cache.update(vec![put("a", "1")], None).unwrap();
+        let rewrite = cache.propose(None, vec![put("a", "1")], None).unwrap().root();
+        let empty = cache.propose(None, vec![], None).unwrap().root();
         (rewrite, empty)
     }
     let (rewrite, empty) = roots(|| LruWrite::new(2));
@@ -422,8 +423,8 @@ where
         .update(vec![put("a", "old"), del("b"), put("c", "3"), put("a", "1")], None)
         .unwrap();
     let engine = MemoryStorage::new(MemoryConfig::default());
-    let mut wal = AuthWal::new(speculating(4, 4, 4, 1, 0), engine, set).unwrap();
-    let reader = wal.reader();
+    let mut cache = RightCash::new(speculating(4, 4, 4, 1, 0), engine, set).unwrap();
+    let reader = cache.reader();
     assert_eq!(reader.root(), root);
     assert_ne!(root, EMPTY_ROOT);
     assert_eq!(reader.revision(root).unwrap().root(), root);
@@ -438,15 +439,15 @@ where
         vec![del("c"), put("f", "6")],
     ] {
         let hints: Vec<_> = batch.iter().filter_map(|op| op.key().cloned()).collect();
-        wal.prefetch(None, &hints);
-        agree(&mut reference, &mut wal, batch);
+        cache.prefetch(None, &hints);
+        agree(&mut reference, &mut cache, batch);
         for key in ["a", "b", "c", "d", "e", "f"] {
             assert_eq!(reader.get(&k(key)).unwrap(), reference.reader().get(&k(key)).unwrap());
         }
     }
     assert!(reader.stats().total_evictions > 0);
     assert_no_failures(&reader.stats().speculation);
-    wal.close().unwrap();
+    cache.close().unwrap();
     reference.close().unwrap();
 }
 
@@ -462,13 +463,13 @@ fn new_accepts_a_populated_set_with_matching_policy_and_root() {
 fn new_validates_supplied_set_capacity_and_empty_genesis() {
     use crate::set::Snapshot;
     let set = Snapshot::empty(LtHash::new(), Fifo::<K>::new(2), 4).unwrap();
-    let mut wal = AuthWal::new(config(4, 3), MemoryStorage::<K, V>::new(MemoryConfig::default()), set).unwrap();
-    assert_eq!(wal.reader().root(), EMPTY_ROOT);
-    assert_eq!(wal.reader().stats().occupancy, 0);
-    wal.close().unwrap();
+    let mut cache = RightCash::new(config(4, 3), MemoryStorage::<K, V>::new(MemoryConfig::default()), set).unwrap();
+    assert_eq!(cache.reader().root(), EMPTY_ROOT);
+    assert_eq!(cache.reader().stats().occupancy, 0);
+    cache.close().unwrap();
 
     let set = Snapshot::empty(LtHash::new(), Fifo::<K>::new(2), 4).unwrap();
-    let result = AuthWal::new(config(5, 3), MemoryStorage::<K, V>::new(MemoryConfig::default()), set);
+    let result = RightCash::new(config(5, 3), MemoryStorage::<K, V>::new(MemoryConfig::default()), set);
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
     assert!(Snapshot::<K, V, _, _>::empty(LtHash::new(), Fifo::new(0), 0).is_err());
     let too_large = Snapshot::from_entries(
@@ -530,17 +531,17 @@ fn new_rejects_bad_configuration_and_a_used_engine() {
 fn firewood_hashing_algorithm_is_committed_before_eviction() {
     use crate::storage::{FirewoodConfig, FirewoodStorage};
     let dir = TempDir::new("hashing-id");
-    let mut wal = new_empty(
+    let mut cache = new_empty(
         config(4, 3),
         FirewoodStorage::new(FirewoodConfig::new(dir.db())).unwrap(),
         Fifo::new(2),
         Rehash,
     )
     .unwrap();
-    let node = wal.propose(None, vec![put("a", "1")], None).unwrap();
+    let node = cache.propose(None, vec![put("a", "1")], None).unwrap();
     let snapshot = node.node().snapshot();
     assert_eq!(StorageProposal::<K, V>::root(&**node.node().storage_view()), EMPTY_ROOT);
-    let mut terms = wal.terms.clone();
+    let mut terms = cache.terms.clone();
     let expected_id = if cfg!(feature = "ethhash") {
         "firewood/ethereum"
     } else {
@@ -564,7 +565,7 @@ fn firewood_hashing_algorithm_is_committed_before_eviction() {
         "firewood/ethereum"
     };
     assert_ne!(node.root(), root_for(&terms));
-    wal.close().unwrap();
+    cache.close().unwrap();
 }
 
 #[cfg(feature = "firewood")]
@@ -576,15 +577,16 @@ fn plain_path_on_firewood() {
     cfg.truncate = true;
     cfg.revisions = 8;
     let engine = FirewoodStorage::new(cfg).unwrap();
-    let mut wal: AuthWal<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
+    let mut cache: RightCash<K, V, LtHash, LruWrite<K>, FirewoodStorage> =
         new_empty(config(4, 3), engine, LruWrite::new(2), LtHash::new()).unwrap();
-    let reader = wal.reader();
+    let reader = cache.reader();
     for i in 0..10u32 {
-        wal.update(
-            vec![put(&format!("k{i}"), &format!("v{i}")), put("hot", &i.to_string())],
-            None,
-        )
-        .unwrap();
+        cache
+            .update(
+                vec![put(&format!("k{i}"), &format!("v{i}")), put("hot", &i.to_string())],
+                None,
+            )
+            .unwrap();
     }
     for i in 0..10u32 {
         assert_eq!(reader.get(&k(&format!("k{i}"))).unwrap(), Some(k(&format!("v{i}"))));
@@ -592,5 +594,5 @@ fn plain_path_on_firewood() {
     assert_eq!(reader.get(&k("hot")).unwrap(), Some(k("9")));
     let stats = reader.stats();
     assert!(stats.total_evictions > 0 && stats.occupancy <= 4);
-    wal.close().unwrap();
+    cache.close().unwrap();
 }

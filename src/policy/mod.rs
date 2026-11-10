@@ -40,13 +40,13 @@ use sha2::{Digest as _, Sha256};
 
 use crate::types::{Digest, Error, Key, Result, len_prefix};
 
-/// Return SHA-256 of `"auth_wal/policy-params"` followed by `low_watermark`
+/// Return SHA-256 of `"right_cash/policy-params"` followed by `low_watermark`
 /// encoded as a little-endian `u64`. The input is the number of entries to
 /// retain after eviction; this digest excludes local prediction settings.
 /// The high watermark only schedules precomputation and is not hashed.
 pub(crate) fn params_digest(low_watermark: usize) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"auth_wal/policy-params");
+    hasher.update(b"right_cash/policy-params");
     hasher.update((low_watermark as u64).to_le_bytes());
     hasher.finalize().into()
 }
@@ -104,7 +104,7 @@ pub(crate) fn validate_watermarks(low_watermark: usize, trigger: Option<usize>, 
 }
 
 /// Domain of [`order_digest`].
-const STATE_DOMAIN: &str = "auth_wal/policy-state";
+const STATE_DOMAIN: &str = "right_cash/policy-state";
 
 /// Return the consensus-state digest for policy identifier `name` and its
 /// eviction `order`, an iterator of borrowed `(height, key)` pairs in eviction
@@ -358,7 +358,7 @@ pub trait EvictionPolicy<K: Key>: Clone + Send + Sync + 'static {
     fn reset_hints(&mut self);
 
     /// The policy's own parameters against the set's `capacity` (design
-    /// §6.2), checked once by `AuthWal::new`: `InvalidConfig` for a rule
+    /// §6.2), checked once by `RightCash::new`: `InvalidConfig` for a rule
     /// that could leave the set over capacity (the v0 policies: a low
     /// watermark above capacity, or a high watermark outside [low, capacity]).
     /// Nothing to check by default.

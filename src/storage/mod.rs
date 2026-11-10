@@ -3,8 +3,8 @@
 //! interface-level support with speculation disabled. The Go layer never sees
 //! which backend is in use.
 //!
-//! Ownership (R19, R20): the engine is owned by the writer (`AuthWal`), which
-//! closes it through `&mut self`; everything auth_wal reads from or proposes
+//! Ownership (R19, R20): the engine is owned by the writer (`RightCash`), which
+//! closes it through `&mut self`; everything right_cash reads from or proposes
 //! on storage goes through a proposal handle (a node's pinned view,
 //! `StorageEngine::head` for the genesis node), so there is no revision type,
 //! no engine-level read, propose or revision lookup here. Proof methods arrive
@@ -51,7 +51,7 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 /// 4. `propose` on a **committed** handle proposes on the engine's committed
 ///    state, provided the handle's revision is the engine's current revision
 ///    by identity both before and after the call, and returns
-///    `ProposalOrphaned` otherwise; it never panics. auth_wal's writer
+///    `ProposalOrphaned` otherwise; it never panics. right_cash's writer
 ///    proposes on committed handles for the plain proposal of a child whose
 ///    parent's pinned view is committed (a child of the head, or of a live
 ///    node that inherited the head's view; `F` never does, it chains on the
@@ -72,7 +72,7 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 ///    contract tests verify both on both backends.
 /// 6. Committed proposals do not pin the engine: `close` succeeds once no
 ///    live proposal handle (uncommitted and not failed) is alive, however
-///    many committed proposal handles remain (`AuthWal::close` relies on it:
+///    many committed proposal handles remain (`RightCash::close` relies on it:
 ///    the committed node keeps its pinned view), and reports `ActiveHandles`
 ///    while one is (both v0 adapters count them). `close` is idempotent;
 ///    afterwards reads through committed handles keep answering, and
@@ -82,7 +82,7 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 ///    proposal and proposable per item 4: `head()?.propose(..)` is the one
 ///    way to propose on the committed state.
 pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
-    /// Return this handle's cached storage root. This is not auth_wal's
+    /// Return this handle's cached storage root. This is not right_cash's
     /// combined root and does not check whether the handle is still readable.
     fn root(&self) -> Hash;
 
@@ -95,7 +95,7 @@ pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
     /// Read-through warming of the trie paths of `keys` through this handle:
     /// one `get` per key, which on firewood under `CacheReadStrategy::All`
     /// populates the node cache along the path; it continues past errors
-    /// and returns the first. auth_wal's hints do not call it (design §9.4,
+    /// and returns the first. right_cash's hints do not call it (design §9.4,
     /// R26: the steps are the warming); the benchmark's engine-only baseline
     /// uses it to emulate a native warm call, and the contract tests
     /// exercise it.
@@ -112,7 +112,7 @@ pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
     /// Return a new uncommitted child with borrowed `batch` applied in order.
     /// The result must own everything it needs after the inputs are dropped.
     /// `metadata` is optional engine metadata; the built-in adapters ignore it
-    /// (auth_wal hashes it separately into its combined root).
+    /// (right_cash hashes it separately into its combined root).
     ///
     /// A live handle chains from its own state. A committed handle may propose
     /// only while it is the engine's current revision by identity, otherwise
@@ -139,7 +139,7 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
 
     /// Whether the root is a function of the stored state alone (firewood,
     /// `MemoryStorage`: true; QMDB: false, its root covers the op history).
-    /// Speculative eviction requires `true` (design §9.3); `AuthWal::new`
+    /// Speculative eviction requires `true` (design §9.3); `RightCash::new`
     /// rejects `speculate` otherwise.
     const ROOT_IS_STATE_FUNCTION: bool;
 
@@ -152,7 +152,7 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
     /// Size of the engine's revision window, checked against design §8.
     fn revisions(&self) -> usize;
 
-    /// Committed root. A fresh engine reports `EMPTY_ROOT` (`AuthWal::new`'s
+    /// Committed root. A fresh engine reports `EMPTY_ROOT` (`RightCash::new`'s
     /// freshness check, design §1; the benchmark baseline).
     fn root(&self) -> Hash;
 
@@ -162,17 +162,17 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
     /// engine.
     fn head(&self) -> Result<Self::Proposal>;
 
-    /// Pass-through hook for `AuthWal::prune`; no-op by default.
+    /// Pass-through hook for `RightCash::prune`; no-op by default.
     fn prune(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Releases the engine (`AuthWal::close`). Exclusive: the writer owns the
+    /// Releases the engine (`RightCash::close`). Exclusive: the writer owns the
     /// engine (R19), so an adapter keeps its database in a plain field and
     /// needs no lock to take it out. `ActiveHandles` while a live proposal
     /// handle is alive (item 6; both v0 adapters count them); idempotent. The
     /// A successful close must make accepted commits durable for a persistent
-    /// engine: auth_wal publishes its checkpoint only after this returns Ok.
+    /// engine: right_cash publishes its checkpoint only after this returns Ok.
     /// The default is a no-op for an engine with nothing to release.
     fn close(&mut self) -> Result<()> {
         Ok(())

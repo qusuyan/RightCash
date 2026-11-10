@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Experiment 4: bare firewood vs auth_wal vs auth_wal with precomputation.
+"""Experiment 4: bare firewood vs right_cash vs right_cash with precomputation.
 
 zipf (exponent 1.2) and tenkrandom on a 1M-row firewood, LRU-write and
-rehash for auth_wal. One panel per workload: propose latency, mean and
+rehash for right_cash. One panel per workload: propose latency, mean and
 p99. Median over seeds, whiskers = min-max. The table also gives
 prefetch latency and the time per block in each API call (prefetch,
 propose, commit and their sum, excluding the emulated execution gaps).

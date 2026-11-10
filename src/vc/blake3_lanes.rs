@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn every_lane_matches_the_blake3_crate() {
         let data: Vec<u8> = (0..MAX_LEN * LANES).map(|i| (i * 31 + 7) as u8).collect();
-        let key = blake3::derive_key("auth_wal/blake3_lanes test", &[]);
+        let key = blake3::derive_key("right_cash/blake3_lanes test", &[]);
         // Every length around the block boundaries, alone and in a full set
         // of lanes of one length.
         for len in [0, 1, 4, 31, 63, 64, 65, 77, 127, 128, 129, 512, 1000, 1023, 1024] {

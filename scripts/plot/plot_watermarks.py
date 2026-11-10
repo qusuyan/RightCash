@@ -67,15 +67,15 @@ def median_seed(g):
 
 
 def load(a, exp):
-    """Firewood reference and auth_wal trials (with propose parts) of one
+    """Firewood reference and right_cash trials (with propose parts) of one
     experiment directory."""
     d = a.results / exp
     df = c.load(d)
     fw = df[df["config"] == "firewood"]
     ref = {"propose_mean_ms": fw["propose_mean_ms"].median(), "propose_p99_ms": fw["propose_p99_ms"].median()}
-    wal = df[df["config"] != "firewood"].copy()
-    wal = wal.join(pd.DataFrame([decompose(d, t) for t in wal["trial"]], index=wal.index))
-    return ref, wal
+    cache = df[df["config"] != "firewood"].copy()
+    cache = cache.join(pd.DataFrame([decompose(d, t) for t in cache["trial"]], index=cache.index))
+    return ref, cache
 
 
 def main():
@@ -91,9 +91,9 @@ def main():
             point = lambda v: {"C": v, **{k: v - g for k, g in gaps.items()}}
             fixed = (f"trigger = capacity − {gaps['T']}, low watermark = capacity − {gaps['L']}")
         else:
-            ref, wal = load(a, "watermarks")
+            ref, cache = load(a, "watermarks")
             others = {k: v for k, v in BASE.items() if k != knob}
-            sel = wal
+            sel = cache
             for k, v in others.items():
                 sel = sel[sel[COLUMNS[k]] == v]
             point = lambda v, knob=knob: {**BASE, knob: v}
@@ -129,7 +129,7 @@ def main():
 
         ax = axes[1]
         med = s[("propose_p99_ms", "median")]
-        ax.bar(x, med, 0.6, color=c.TARGETS["auth_wal_spec"][1], label=f"{c.TARGETS['auth_wal_spec'][0]} (p99)",
+        ax.bar(x, med, 0.6, color=c.TARGETS["right_cash_spec"][1], label=f"{c.TARGETS['right_cash_spec'][0]} (p99)",
                edgecolor=c.SURFACE, linewidth=0.6)
         ax.errorbar(x, med, yerr=[med - s[("propose_p99_ms", "min")], s[("propose_p99_ms", "max")] - med],
                     fmt="none", ecolor=c.INK_2, elinewidth=1, capsize=2)

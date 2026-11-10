@@ -1,7 +1,7 @@
 """Shared loading, aggregation and styling for the experiment plots.
 
 Each experiment directory written by `scripts/run_experiments.py` holds
-`results.csv` (one record per trial) and, for auth_wal trials,
+`results.csv` (one record per trial) and, for right_cash trials,
 `breakdown.csv` (per-phase propose/commit timings). Every configuration
 runs with three seeds shared across targets; the plots show the median
 over seeds with min-max whiskers, and each script prints the same numbers
@@ -30,13 +30,13 @@ AXIS = "#c3c2b7"
 SURFACE = "#fcfcfb"
 
 # The system's name in figure text.
-NAME = "auth_wal"
+NAME = "right_cash"
 
 # One color per entity, the same in every figure.
 TARGETS = {
     "firewood": ("firewood (bare)", SLOTS[0]),
-    "auth_wal": ("auth_wal", SLOTS[1]),
-    "auth_wal_spec": ("auth_wal + precompute", SLOTS[2]),
+    "right_cash": ("right_cash", SLOTS[1]),
+    "right_cash_spec": ("right_cash + precompute", SLOTS[2]),
 }
 
 # Workload names as figure text, in panel order (left to right).
@@ -62,8 +62,8 @@ BLOG_THEME = {
     "SURFACE": "#222831",
 }
 BLOG_NAME = "RightCash"
-BLOG_LABELS = {"firewood": "Firewood (bare)", "auth_wal": f"{BLOG_NAME} w/o Precomputation",
-               "auth_wal_spec": f"{BLOG_NAME} w/ Precomputation"}
+BLOG_LABELS = {"firewood": "Firewood (bare)", "right_cash": f"{BLOG_NAME} w/o Precomputation",
+               "right_cash_spec": f"{BLOG_NAME} w/ Precomputation"}
 BLOG_WORKLOADS = {"tenkrandom": "Mixed", "zipf": "Zipf"}
 
 
@@ -99,10 +99,13 @@ def subtitle(fig, text, **kw):
 
 def load(exp_dir):
     df = pd.read_csv(exp_dir / "results.csv")
+    # Results recorded before the 2026-11-09 rename call the system
+    # auth_wal, in trial ids and the target column.
+    df["target"] = df["target"].str.replace("auth_wal", "right_cash", regex=False)
     # Trial ids end in -<seed>; the configuration is everything before,
     # less the workload prefix of experiments that run on several workloads
     # (`zipf-lru-write-101`; the workload is its own column).
-    df["config"] = df["trial"].str.rsplit("-", n=1).str[0]
+    df["config"] = df["trial"].str.replace("auth_wal", "right_cash", regex=False).str.rsplit("-", n=1).str[0]
     df["config"] = [c.removeprefix(f"{w}-") for c, w in zip(df["config"], df["workload"])]
     ms = [c for c in df.columns if c.endswith("_us")]
     for c in ms:

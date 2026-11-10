@@ -2,7 +2,7 @@
 members = [".", "benchmark"]
 
 [package]
-name = "auth_wal"
+name = "right_cash"
 version = "0.1.0"
 edition = "2024"
 description = "Authenticated, bounded, in-memory set of recent writes between EVM validators and an authenticated storage engine"

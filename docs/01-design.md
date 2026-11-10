@@ -1,4 +1,4 @@
-# auth_wal design
+# right_cash design
 
 Status: DESIGN v36 (2026-11-03). Clean-shutdown persistence and recovery
 save the latest committed snapshot and restore it against matching storage
@@ -113,7 +113,7 @@ Milestones 0–2 are implemented and reviewed (§13).
 
 ## 1. Goal, non-goals, v0 limitations
 
-`auth_wal` is an authenticated, bounded, in-memory set of recent writes placed
+`right_cash` is an authenticated, bounded, in-memory set of recent writes placed
 between the EVM validators (`Avax-pEVM`, `libevm`) and an authenticated storage
 engine (QMDB via `qmdb-ffi`, or firewood). From the validator's point of view
 it *is* the database: it exposes the same Go `ffi` package shape as `qmdb-ffi`.
@@ -185,7 +185,7 @@ v0 limitations (explicit, consensus-relevant)
  Avax-pEVM / libevm adapter (unchanged, imports package `ffi`)
             │  New / Propose / Commit / Get / Root / Revision / Prefetch / Close
             ▼
- ┌──────────────────────────── auth_wal (Go `ffi` ← C ABI ← Rust) ───────────────────────────┐
+ ┌──────────────────────────── right_cash (Go `ffi` ← C ABI ← Rust) ───────────────────────────┐
  │  Proposal tree: one full copy of the set per proposal (snapshot), one weak parent link    │
  │   ┌─────────────────────┐    ┌──────────────────────┐    ┌───────────────────────────┐    │
  │   │ Snapshot (arrays)   │    │ EvictionPolicy       │    │ VectorCommitment          │    │
@@ -219,41 +219,41 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 `EthereumNodeHashing`, `CacheStrategy`, `CacheAllReads`, `StartMetrics`,
 `Gatherer` (coreth `vm.go`), and `Revision.Drop`.
 
-| Symbol | Behaviour in auth_wal |
+| Symbol | Behaviour in right_cash |
 |---|---|
-| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `AuthWal::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes auth_wal's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; `EngineNotFresh` if the engine already has committed state (§1); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
-| `Recover` (Rust) | `AuthWal::recover(config, storage, vc, policy)` restores `Local::snapshot_path` with matching, reopened storage. Validates the file and reconstructed root, installs the latest committed node, and starts fresh local speculation. See §12.6. |
+| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `RightCash::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes right_cash's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; `EngineNotFresh` if the engine already has committed state (§1); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
+| `Recover` (Rust) | `RightCash::recover(config, storage, vc, policy)` restores `Local::snapshot_path` with matching, reopened storage. Validates the file and reconstructed root, installs the latest committed node, and starts fresh local speculation. See §12.6. |
 | `Update(batch)` / `UpdateWithMetadata` | `Propose` + `Commit` in one call. |
 | `Propose(batch)` / `ProposeWithMetadata` | Copies the parent's set and applies the batch to the copy (§4), the policy evicts if over capacity (§6.1), creates the storage proposal for the evicted writes, returns a `Proposal` whose `Root()` is known immediately (§8). `Root()` is a single 32-byte commitment combining the set commitment, the policy digest and the storage root (§7.3); none of them is exposed separately. Metadata is root-affecting (it enters the preimage; `None` and `Some(empty)` are distinct, as in `qmdb-ffi`) and is also carried by the node's own storage proposal when one exists (on the speculative path, the worker's final proposal; early steps never carry metadata, §9.1). |
 | `Proposal.Get` | Its snapshot, then its pinned storage view (§5); one lookup, no lock on the set side (the storage read takes the adapter's handle read guard, §10 (e)). |
-| `Proposal.Propose` / `ProposeWithMetadata` | Child of a proposal (the adapter chains during block building); in Rust `AuthWal::propose(&mut self, Some(&parent), batch, metadata)`, a writer operation (threading contract below). A handle whose node has since committed behaves as the committed state while that node is the head (equal root, §8); any other node is proposed on as given, as `qmdb-ffi` and firewood accept, and a child of a node that can no longer be committed is itself never committable (`Commit` reports `ParentUncommitted` or `ProposalOrphaned`, §8). `ProposalOrphaned` can still come from the engine: a storage proposal on a committed handle whose root the engine has moved past (§10 item 4). |
-| `Proposal.Commit` | In Rust `AuthWal::commit(&mut self, handle)`: it takes the writer exclusively and consumes the handle, on success and on failure alike, so neither a second commit of the same proposal nor two overlapping commits can be written (R19); after a storage failure the adapter re-proposes the block, and a retry of the same Go handle reports `ProposalConsumed` (§8). Requires the parent to be the head node by identity (§8; `ParentUncommitted` otherwise, as firewood's `NotLatest`, an equal-root twin of the head included; the adapter only ever commits a child of the committed tree root, and qmdb-ffi's cascade commit is not offered, R20); rejects a proposal whose parent was dropped uncommitted (`ProposalOrphaned`, §8). A storage failure leaves the head where it was, returns the error, and poisons the instance if the node's proposal chained on speculative steps (§9.2); the handle is consumed on every outcome, a pre-check failure included (§8). Retargets the precomputation to the new head, unless it already targets it or a live child of it (§9.2), resending retained predictions without waiting for the worker (R17); its own engine commit may wait for a step still being hashed on a handle it commits (§9.2). |
+| `Proposal.Propose` / `ProposeWithMetadata` | Child of a proposal (the adapter chains during block building); in Rust `RightCash::propose(&mut self, Some(&parent), batch, metadata)`, a writer operation (threading contract below). A handle whose node has since committed behaves as the committed state while that node is the head (equal root, §8); any other node is proposed on as given, as `qmdb-ffi` and firewood accept, and a child of a node that can no longer be committed is itself never committable (`Commit` reports `ParentUncommitted` or `ProposalOrphaned`, §8). `ProposalOrphaned` can still come from the engine: a storage proposal on a committed handle whose root the engine has moved past (§10 item 4). |
+| `Proposal.Commit` | In Rust `RightCash::commit(&mut self, handle)`: it takes the writer exclusively and consumes the handle, on success and on failure alike, so neither a second commit of the same proposal nor two overlapping commits can be written (R19); after a storage failure the adapter re-proposes the block, and a retry of the same Go handle reports `ProposalConsumed` (§8). Requires the parent to be the head node by identity (§8; `ParentUncommitted` otherwise, as firewood's `NotLatest`, an equal-root twin of the head included; the adapter only ever commits a child of the committed tree root, and qmdb-ffi's cascade commit is not offered, R20); rejects a proposal whose parent was dropped uncommitted (`ProposalOrphaned`, §8). A storage failure leaves the head where it was, returns the error, and poisons the instance if the node's proposal chained on speculative steps (§9.2); the handle is consumed on every outcome, a pre-check failure included (§8). Retargets the precomputation to the new head, unless it already targets it or a live child of it (§9.2), resending retained predictions without waiting for the worker (R17); its own engine commit may wait for a step still being hashed on a handle it commits (§9.2). |
 | `Proposal.Drop` | Releases the handle's reference; the node, its snapshot and its storage proposal are freed when the last reference goes (the K-ring may hold one, §8; the precomputation refers to its target weakly, and the worker's chain keeps the steps, and through them the target's pinned view, alive until the next retarget or `Close`, §9.2). |
-| `Prefetch(keys)` on `Database`, `Proposal`, `Revision` | **New (R14).** Hint that execution reading through this view is writing `keys`. The keys go to the policy's `hint_writes` when the node is the precomputation's target, retarget it first when the node is a live child of the target (or, with no live target, the head or a live child of it), and otherwise do nothing (§9.2; no engine warming, R26: the steps are the warming, §9.4). Returns after the policy call: the engine work runs on the instance's worker thread (R17, §9.2). A writer operation in Rust (`AuthWal::prefetch(&mut self, view, keys)`, R19) and a writer call on the database handle in the C ABI, which takes the writer mutex (threading contract below): the hint writes the target's policy. Advisory: a wrong hint costs work, never correctness. |
+| `Prefetch(keys)` on `Database`, `Proposal`, `Revision` | **New (R14).** Hint that execution reading through this view is writing `keys`. The keys go to the policy's `hint_writes` when the node is the precomputation's target, retarget it first when the node is a live child of the target (or, with no live target, the head or a live child of it), and otherwise do nothing (§9.2; no engine warming, R26: the steps are the warming, §9.4). Returns after the policy call: the engine work runs on the instance's worker thread (R17, §9.2). A writer operation in Rust (`RightCash::prefetch(&mut self, view, keys)`, R19) and a writer call on the database handle in the C ABI, which takes the writer mutex (threading contract below): the hint writes the target's policy. Advisory: a wrong hint costs work, never correctness. |
 | `Get` | The head's snapshot, then its pinned storage view (§5). The head is resolved under the registry lock, one hold of about 15 ns (§10); the set lookup takes no lock, the storage read the adapter's handle read guard (§10 (e)). |
 | `Root` | Combined root of the committed state (§7.3). `EmptyRoot` is the Ethereum empty-root constant, as in `qmdb-ffi`, reported for an empty height-zero initial set; a seeded set has an authenticated root immediately (§4), so the empty-start adapter's genesis idiom (`Initialized()`, `Revision(EmptyRootHash)`) keeps working. |
 | `Revision(root)` / `LatestRevision` | Resolves the last K committed revisions, then live proposals, under one registry hold; in Rust the result is the same `Handle` type a `Propose` returns (§8). `ErrRevisionNotFound` for an unknown root; `ErrRevisionStale` from `Revision.Get` only when its pinned storage view has left the engine's window: every node owns its snapshot, so set reads never go stale, and an orphan reads its own copy exactly, however many commits later (§5, §8). |
 | `Prune`, `GatherMetrics`, `Gatherer`, `StartMetrics*` | Pass-through / composition. |
-| `Close(ctx)` | Mirrors `qmdb-ffi`: the Go layer waits for its outstanding `Proposal`/`Revision` handles until `ctx` expires (its own keep-alive count, as in `qmdb-ffi`'s `keepalive.go`), then returns `ErrActiveKeepAliveHandles`; otherwise it calls the Rust `AuthWal::close(&mut self)`, a writer operation, which sets the closing flag (`Propose`, `Commit` and `Update` report `Closed` from then on; hints are no-ops), drops the worker's channel and joins it (the step being built finishes, the requests it had already drained are handled, which may build one more step, and nothing is answered, §9.2; the thread's chain, the only speculative engine proposals, drops with it; the writer holds none), and closes the engine through the writer's exclusive reference, which succeeds because committed proposals and revisions do not pin it and reports `ActiveHandles` if a Rust caller still holds a handle to an uncommitted proposal with its own storage proposal (§10 item 6). Reads through handles and `Reader`s keep working afterwards, retained revisions included (a snapshot is memory, a committed engine view stays readable; the Rust side keeps no closed flag for reads, R20; the registry is released with the instance, R22), and `Root` keeps answering with the last committed root. With `Local::snapshot_path`, saves the committed head through the ordered checkpoint protocol in §12.6. Successful close is idempotent; a poisoned instance can close storage but cannot publish a checkpoint. |
+| `Close(ctx)` | Mirrors `qmdb-ffi`: the Go layer waits for its outstanding `Proposal`/`Revision` handles until `ctx` expires (its own keep-alive count, as in `qmdb-ffi`'s `keepalive.go`), then returns `ErrActiveKeepAliveHandles`; otherwise it calls the Rust `RightCash::close(&mut self)`, a writer operation, which sets the closing flag (`Propose`, `Commit` and `Update` report `Closed` from then on; hints are no-ops), drops the worker's channel and joins it (the step being built finishes, the requests it had already drained are handled, which may build one more step, and nothing is answered, §9.2; the thread's chain, the only speculative engine proposals, drops with it; the writer holds none), and closes the engine through the writer's exclusive reference, which succeeds because committed proposals and revisions do not pin it and reports `ActiveHandles` if a Rust caller still holds a handle to an uncommitted proposal with its own storage proposal (§10 item 6). Reads through handles and `Reader`s keep working afterwards, retained revisions included (a snapshot is memory, a committed engine view stays readable; the Rust side keeps no closed flag for reads, R20; the registry is released with the instance, R22), and `Root` keeps answering with the last committed root. With `Local::snapshot_path`, saves the committed head through the ordered checkpoint protocol in §12.6. Successful close is idempotent; a poisoned instance can close storage but cannot publish a checkpoint. |
 | `BatchOp`: `Put`, `Delete`, `PrefixDelete` | `Put`/`Delete` land in the set. `PrefixDelete` is rejected by `Propose` (`PrefixDeleteUnsupported`), as QMDB rejects it behind qmdb-ffi: a bounded set cannot apply a prefix delete to the keys it does not hold, forwarding it would need a storage proposal and ordering rules of its own, and the adapter never emits it (it bumps storage generations instead; R22). The engines keep supporting the op (§10). |
 | Proofs (`ProveLatest` / `VerifyLatest`) | Milestone 5 (§7.4); nothing of it exists in v0 code. Not used by the adapter. |
 | `NodeHashAlgorithm`, `CacheStrategy`, legacy options | Accepted; forwarded to a firewood backend, ignored otherwise, exactly like `qmdb-ffi`. |
 
 **Threading contract (R19).** The Rust core separates the one thread that
 changes state from the threads that read it, and lets the type system do the
-serialising. `AuthWal` is the **writer**: `Propose`, `Proposal.Propose`,
+serialising. `RightCash` is the **writer**: `Propose`, `Proposal.Propose`,
 `Commit`, `Update`, `Prefetch`, `Prune` and `Close` are methods taking `&mut
 self`, so two of them can never overlap and no runtime lock is needed to keep
 them apart; `Commit` also takes the `Proposal` by value, so a committed handle
 cannot be committed twice or read as a proposal afterwards (the committed
-state is read through `Get` or `LatestRevision`). `AuthWal::reader()` returns
+state is read through `Get` or `LatestRevision`). `RightCash::reader()` returns
 a `Reader` (`Clone + Send + Sync`) for the RPC and mempool threads: `Get`,
 `Root`, `Revision`, `LatestRevision` and `Stats`. Go's `Proposal` and
 `Revision` are one Rust type, `Handle` (§8), `Send + Sync` and read-only
 (`Get`, `Root`); handles are returned by the writer and resolved by
 readers, and hold nothing but the node. `Prefetch` on any of the three Go
 objects is a writer operation (planning writes the precomputation, §9.2),
-so in Rust it is `AuthWal::prefetch(&mut self, view, keys)` with the handle
+so in Rust it is `RightCash::prefetch(&mut self, view, keys)` with the handle
 as `view` (`None` for the committed state). The writer has four state-changing
 methods: `propose(parent, batch, metadata)`, `commit(handle)`,
 `update(batch, metadata)` and `prefetch(view, keys)`, plus `prune` and
@@ -292,7 +292,7 @@ engine's read-cache strategy is forced to cache all reads (§9.4), overriding
 
 ## 4. Data model (R2, R7, R16, R18, R20)
 
-The public Rust `set::Snapshot` is the input to `AuthWal::new(config, storage,
+The public Rust `set::Snapshot` is the input to `RightCash::new(config, storage,
 set)`. `Snapshot::empty(vc, policy, capacity)` constructs an empty initial set;
 `Snapshot::from_entries(vc, policy, capacity, entries)` builds a populated set
 from `(K, Entry<V>)` pairs through normal policy writes and commitment updates.
@@ -378,7 +378,7 @@ about 20 ms (entry map 9.5 ms, policy maps 2 ms, the §7.3 policy digest
 7.4 ms) and a commit about 8 ms to drop the retired snapshot, before the
 first op; 128 retained revisions hold 3.4 GB. At the default 10k the copy
 pays for itself once the trie under the set is large (clarification 28:
-auth_wal ahead of bare firewood from 100k rows on, by a third at 1M rows
+right_cash ahead of bare firewood from 100k rows on, by a third at 1M rows
 on `zipf`; §12.13), so R20 stands at 10k. Whether it should hold for a
 larger set is open: §12.13 has the measured alternatives, §12.15 the shape
 a mutable base would take.
@@ -417,7 +417,7 @@ a mutable base would take.
   batch and starts at height 1 (§1). Recovery must restore historical state
   separately (§12.6). The chain's genesis block is itself committed as a
   proposal, so under the v0 assumption (fresh start, one proposal per block)
-  a block at chain height `h` sits at auth_wal height `h + 1`; the adapter's
+  a block at chain height `h` sits at right_cash height `h + 1`; the adapter's
   own height bookkeeping is Go-side and never reads this value. The `ffi`
   interface does not pass a height. Keys written at the same height
   tie-break by key bytes in eviction order (§6.1).
@@ -432,9 +432,9 @@ a mutable base would take.
   typed callers, such as a Rust-side adapter with 32-byte keys or fixed-size
   slots for KZG, pay no boxing. Both must be **cheap to clone**: every
   proposal copies every key and value of the set (above), so the FFI layer
-  instantiates `AuthWal<Arc<[u8]>, Arc<[u8]>, _, _, _>` (one reference count
+  instantiates `RightCash<Arc<[u8]>, Arc<[u8]>, _, _, _>` (one reference count
   per clone; `Box<[u8]>` values would add about 0.5 ms per copy) and the
-  benchmark's auth_wal target (milestone 1) uses the same types.
+  benchmark's right_cash target (milestone 1) uses the same types.
   `Value::from_bytes` lets a storage adapter rebuild a
   value from the engine's bytes.
 
@@ -469,7 +469,7 @@ as of that node (§4), and a **pinned storage view**, the storage proposal
 created by the nearest ancestor-or-self that created one (§6.3), otherwise
 the committed handle that chain started from (always a proposal handle, §10
 item 7).
-Neither changes after the node exists, so a read takes no lock of auth_wal's
+Neither changes after the node exists, so a read takes no lock of right_cash's
 (the storage read takes the adapter's handle read guard, §10 (e)). Lookup
 order for a read on a node `N`:
 
@@ -545,7 +545,7 @@ pub trait EvictionPolicy<K: Key>: Clone + Send + Sync + 'static {   // Clone: co
     /// Digest of the consensus state, a root term (§7.3); never covers the marks.
     fn state_digest(&self) -> Digest;
     fn name(&self) -> &'static str;
-    fn params_digest(&self) -> Digest;          // the policy's own parameters (zeros if none); v0: SHA-256("auth_wal/policy-params" ‖ low_watermark u64 LE)
+    fn params_digest(&self) -> Digest;          // the policy's own parameters (zeros if none); v0: SHA-256("right_cash/policy-params" ‖ low_watermark u64 LE)
 }
 ```
 
@@ -633,7 +633,7 @@ margin zero. Actual eviction clears activation for the next window;
 
 Parameters are the consensus low watermark and local high watermark; the
 benchmark defaults are 70% and 90% of capacity (§6.2). `state_digest` remains
-BLAKE3 `derive_key("auth_wal/policy-state")` over the length-prefixed policy
+BLAKE3 `derive_key("right_cash/policy-state")` over the length-prefixed policy
 name and eviction order as `(height u64 LE, length-prefixed key)` items.
 The prediction update changes neither this encoding nor actual eviction.
 
@@ -696,7 +696,7 @@ the next one to trigger; `reset_hints` forgets it entirely.
 
 Capacity and low watermark are consensus parameters. High watermark, margin,
 and marks are local and cannot change victims or roots. The v0 `params_digest`
-hashes only `"auth_wal/policy-params" || low_watermark (u64 LE)`. Removing the
+hashes only `"right_cash/policy-params" || low_watermark (u64 LE)`. Removing the
 old trigger field changes the root encoding relative to the earlier version;
 old benchmark roots are not a compatibility reference. Validation requires
 `0 <= low_watermark <= high_watermark <= capacity`. Benchmark defaults are
@@ -778,8 +778,8 @@ milestone 5 (§7.4); v0 code carries none of them (R20).
 | `lthash` (v0 default) | 2 KiB lattice-hash vector (1024 × u16 lanes) | one XOF + lane add/sub | none (set-level only) | Additively homomorphic: `C ← C − H(k,old) + H(k,new)`. Cheap, order-independent, authenticates the set as a whole. |
 | `kzg` (milestone 5) | one G1 element (48 B, hashed to 32 for the root) + `key → slot` map (a slot's value commits to the §7.2 entry item) | one scalar mult | yes, constant size | Slot count must exceed `capacity` by a safety factor (a `capacity`-slot table is guaranteed to collide near full occupancy); collision policy is open (§12.2). Trusted setup of slot-count size. The slot map is consensus state: it lives on the `Snapshot`, copied with the entries (one more per-key map in the per-proposal copy, §12.14), to be settled together with §12.2 in milestone 5. No code in v0. |
 | `merkle` (reference) | whole sparse Merkle tree (persistent) over `SHA-256(key)`, depth 256, leaf = the entry item below | 256 hashes per update | yes | No slots, so no collisions; parameter-free. Slow but proof-friendly baseline for tests and benchmarks; its persistent tree is cloned with the snapshot in O(1). |
-| `merkle-blake3` | the snapshot's `b`-ary tree (all levels in one buffer, `Arc`, shared by a clone until the child's `commitment` replaces it) and the keys `apply` reported since | a key clone per op; per proposal one keyed BLAKE3 per changed entry and one per run of `b` hashes per level | yes (milestone 5; the tree is kept for it) | Whole-set scheme, built bottom-up at `commitment`: a leaf is keyed BLAKE3 (key `derive_key("auth_wal/merkle-blake3 leaf", "")`) over the entry item below; each level groups the one below into runs of `b` in key order (the last run may be shorter, a run of one is still hashed) and hashes each run's concatenation with keyed BLAKE3 (key `derive_key("auth_wal/merkle-blake3 node", "")`); the build stops at the first level of one hash (not, as first described, once a level has fewer than `b` hashes, which would add a single-child node above a level of exactly one or exactly `b` hashes). The commitment is `derive_key("auth_wal/merkle-blake3")` over `u64 LE` entry count ‖ top (32 zero bytes when empty); `params_digest` is `derive_key("auth_wal/merkle-blake3 params")` over `b` as `u64 LE`. Branching `b ≥ 2`, default 16 (a full node is 512 bytes, eight 64-byte blocks of one 1 KiB BLAKE3 chunk; any `b` up to 32 stays within one chunk); `--merkle-branching` in the benchmark. Memory: about `32·n·b/(b−1)` bytes per retained snapshot (0.34 MB at 10k entries, 3.4 MB at 100k, `b` = 16), times the retained revisions and live proposals; a child's clone of the state shares the parent's tree only until the child's `commitment` replaces it. Computation, identical in result to the full build: `apply` records each changed key with whether it was in the parent and is in the child, and `commitment` copies the parent's leaf hash for every entry no transition touched (the parent's entry at position untouched-before + replaced-or-removed-before, both counted in key order), hashing only the rest; the levels above are rebuilt, since an insert or removal shifts every later run; transitions that do not add up against the parent's leaves fall back to hashing every leaf (a debug assertion), and debug builds also compare every reused leaf with its entry's hash, which catches a change never reported to `apply`. Leaves and nodes are hashed eight at a time, one per 32-bit lane of AVX2 (`src/vc/blake3_lanes.rs`, checked against the blake3 crate; without AVX2 each message is a plain `blake3::keyed_hash`, which a portable lane loop did not beat): every leaf of an item up to 1 KiB and every node with `b` ≤ 32 is one BLAKE3 chunk. The tree is one allocation: a propose that allocated each level separately blocked for 1–4 ms in about 3% of blocks on the allocator lock while the precomputation worker freed memory. Measured in situ (tenkrandom, 1M rows, capacity 10,000 / trigger 7,900 / low 3,701, precomputation on, 200 blocks, 3 seeds): the commitment costs 295–309 µs mean, 456–602 µs p99, against 912 µs / 5.0 ms for one blake3 call per hash and no reuse, and 150–163 µs / 356–440 µs for `rehash`; with the worker off (and the tree still allocated per level), 307 µs / 416 µs. |
-| `rehash` (R34, clarification 32) | none | nothing per op; one keyed BLAKE3 (`derive_key`, domain `auth_wal/rehash`) per proposal over `u64 LE` entry count ‖ every entry item in key order | none (set-level only) | Whole-set scheme. The entries are serialised into one buffer and hashed with one `update`: 0.36–0.45 ms at 10k entries of 32-byte keys and values (0.77 MB; the same hash as 30k small `update` calls costs 1.6 ms, `scratchpad` micro-benchmark), against 1.1 µs per lattice item. In situ it costs 0.66–0.75 ms per block at 10k while a lattice item costs 2.7–2.8 µs (§14 "Clarification 32"), so it wins while the block's items (inserts + 2 × rewrites + victims) exceed about a fortieth of the set: 250 items at 10k, far under both benchmark workloads (about 1570 on `zipf`, 4800 on `tenkrandom`), where it cuts propose from 10.5 to 6.9 ms and from 21.5 to 9.1 ms; at 100k (7.7 MB, several ms) the lattice wins for `zipf`-sized blocks. `lthash` stays the default until the owner decides. |
+| `merkle-blake3` | the snapshot's `b`-ary tree (all levels in one buffer, `Arc`, shared by a clone until the child's `commitment` replaces it) and the keys `apply` reported since | a key clone per op; per proposal one keyed BLAKE3 per changed entry and one per run of `b` hashes per level | yes (milestone 5; the tree is kept for it) | Whole-set scheme, built bottom-up at `commitment`: a leaf is keyed BLAKE3 (key `derive_key("right_cash/merkle-blake3 leaf", "")`) over the entry item below; each level groups the one below into runs of `b` in key order (the last run may be shorter, a run of one is still hashed) and hashes each run's concatenation with keyed BLAKE3 (key `derive_key("right_cash/merkle-blake3 node", "")`); the build stops at the first level of one hash (not, as first described, once a level has fewer than `b` hashes, which would add a single-child node above a level of exactly one or exactly `b` hashes). The commitment is `derive_key("right_cash/merkle-blake3")` over `u64 LE` entry count ‖ top (32 zero bytes when empty); `params_digest` is `derive_key("right_cash/merkle-blake3 params")` over `b` as `u64 LE`. Branching `b ≥ 2`, default 16 (a full node is 512 bytes, eight 64-byte blocks of one 1 KiB BLAKE3 chunk; any `b` up to 32 stays within one chunk); `--merkle-branching` in the benchmark. Memory: about `32·n·b/(b−1)` bytes per retained snapshot (0.34 MB at 10k entries, 3.4 MB at 100k, `b` = 16), times the retained revisions and live proposals; a child's clone of the state shares the parent's tree only until the child's `commitment` replaces it. Computation, identical in result to the full build: `apply` records each changed key with whether it was in the parent and is in the child, and `commitment` copies the parent's leaf hash for every entry no transition touched (the parent's entry at position untouched-before + replaced-or-removed-before, both counted in key order), hashing only the rest; the levels above are rebuilt, since an insert or removal shifts every later run; transitions that do not add up against the parent's leaves fall back to hashing every leaf (a debug assertion), and debug builds also compare every reused leaf with its entry's hash, which catches a change never reported to `apply`. Leaves and nodes are hashed eight at a time, one per 32-bit lane of AVX2 (`src/vc/blake3_lanes.rs`, checked against the blake3 crate; without AVX2 each message is a plain `blake3::keyed_hash`, which a portable lane loop did not beat): every leaf of an item up to 1 KiB and every node with `b` ≤ 32 is one BLAKE3 chunk. The tree is one allocation: a propose that allocated each level separately blocked for 1–4 ms in about 3% of blocks on the allocator lock while the precomputation worker freed memory. Measured in situ (tenkrandom, 1M rows, capacity 10,000 / trigger 7,900 / low 3,701, precomputation on, 200 blocks, 3 seeds): the commitment costs 295–309 µs mean, 456–602 µs p99, against 912 µs / 5.0 ms for one blake3 call per hash and no reuse, and 150–163 µs / 356–440 µs for `rehash`; with the worker off (and the tree still allocated per level), 307 µs / 416 µs. |
+| `rehash` (R34, clarification 32) | none | nothing per op; one keyed BLAKE3 (`derive_key`, domain `right_cash/rehash`) per proposal over `u64 LE` entry count ‖ every entry item in key order | none (set-level only) | Whole-set scheme. The entries are serialised into one buffer and hashed with one `update`: 0.36–0.45 ms at 10k entries of 32-byte keys and values (0.77 MB; the same hash as 30k small `update` calls costs 1.6 ms, `scratchpad` micro-benchmark), against 1.1 µs per lattice item. In situ it costs 0.66–0.75 ms per block at 10k while a lattice item costs 2.7–2.8 µs (§14 "Clarification 32"), so it wins while the block's items (inserts + 2 × rewrites + victims) exceed about a fortieth of the set: 250 items at 10k, far under both benchmark workloads (about 1570 on `zipf`, 4800 on `tenkrandom`), where it cuts propose from 10.5 to 6.9 ms and from 21.5 to 9.1 ms; at 100k (7.7 MB, several ms) the lattice wins for `zipf`-sized blocks. `lthash` stays the default until the owner decides. |
 
 **Lattice accumulator encoding** (shared by `lthash` and `MemoryStorage`'s
 root). An item is the concatenation of its fields, each as
@@ -813,7 +813,7 @@ what `Revision(root)` is keyed by.
 
 ```
 root(node) = EMPTY_ROOT                                         if node.height == 0
-           = SHA-256( "auth_wal/v1"                                   (raw bytes, no length prefix)
+           = SHA-256( "right_cash/v1"                                   (raw bytes, no length prefix)
                     ‖ len ‖ scheme_id ‖ len ‖ policy_name ‖ len ‖ engine_id   (u32 LE length-prefixed)
                     ‖ scheme.params_digest() ‖ policy.params_digest()
                     ‖ capacity                                   (u64 LE: in force at the node, §6.2)
@@ -966,7 +966,7 @@ closed flag.
   node it was built on (the registry's head node in that case) and registered in the live index. The registry is held twice, for
   nanoseconds: once to resolve the parent (one `Arc` clone and a root compare) and
   once to register the child (the batch's counts go to atomics with no
-  lock, §9.5); nothing else of auth_wal's is locked, and nothing can commit
+  lock, §9.5); nothing else of right_cash's is locked, and nothing can commit
   meanwhile (`Propose` and `Commit` share `&mut self`).
   When the parent is the precomputation's target, `Propose` calls the
   worker's `finish` (or, evicting nothing, the reply-less block end of R35,
@@ -1183,7 +1183,7 @@ identity. `Commit` of the kept child makes no engine commit. The prediction
 can span any number of these blocks, but the proposal budget remains per
 chain, with one slot always reserved for finalization.
 
-**Retractions remain explicit.** auth_wal keeps no old-value cache: both
+**Retractions remain explicit.** right_cash keeps no old-value cache: both
 early and final retractions read the chain base and produce `Put(old)` or
 `Delete`. This costs a read and another hashing of the path. A Firewood
 restore operation could remove that cost (§12.10 (e), `docs/TODO.md`), but
@@ -1196,7 +1196,7 @@ its consensus state and digest are unaffected by hints (§6.1). The writer
 owns the weak target-node identity and converts policy answers into owned
 operations. The worker owns the engine chain: its base and latest views,
 proposal count, and the pending map. All writer operations take `&mut self`;
-the worker receives ordered requests through `std::sync::mpsc`. No auth_wal
+the worker receives ordered requests through `std::sync::mpsc`. No right_cash
 lock is held across a storage call or a worker wait.
 
 **Requests.** `Submit` queues operations without waiting. An asynchronous
@@ -1269,18 +1269,18 @@ including its final proposal, across any number of kept blocks. At most
 refinement merge into one proposal at `Propose`. Reusing an already exact
 latest view needs no additional proposal. The returned node records only
 ancestor links (`total proposals − 1`); the last proposal is its own storage
-view. Firewood commits those links and that view in order, so one auth_wal
+view. Firewood commits those links and that view in order, so one right_cash
 commit advances the engine by at most `rounds` revisions. An engine window
-of `K × rounds` therefore covers the K retained auth_wal revisions (§8).
+of `K × rounds` therefore covers the K retained right_cash revisions (§8).
 
 Firewood's persistence queue is a separate limit. `FirewoodConfig` exposes
 `commit_permits` through the backend's `max_persistence_gap` option,
 with adapter default 1. It must be positive and smaller than the engine
 revision window. The benchmark defaults it to `speculation_rounds` for
-speculative auth_wal runs and 1 otherwise, with an explicit override (§11).
+speculative right_cash runs and 1 otherwise, with an explicit override (§11).
 More permits allow more committed revisions to await persistence; commits
 still use Firewood's existing asynchronous path and can encounter
-backpressure when the permits are exhausted. No extra auth_wal commit queue
+backpressure when the permits are exhausted. No extra right_cash commit queue
 or change to Firewood's behavior is introduced.
 
 `Commit` does not wait on a worker request. Retargeting or pipelined hints
@@ -1351,7 +1351,7 @@ R32; `speculation_on_firewood`). Test 6, the timing assertions, is pending.
 
 ### 9.4 Prefetch hints (R14)
 
-**Meaning.** A prefetch hint tells auth_wal which keys execution is writing
+**Meaning.** A prefetch hint tells right_cash which keys execution is writing
 so the policy can refine its prediction (§9.2). It is the hint API R14 asked
 for, kept as an interface; what it feeds is the precomputation. It warms
 nothing through the engine (clarification 22): a hinted key not in the set
@@ -1361,13 +1361,13 @@ retracted keys', are warmed by the steps that wrote them.
 
 **API.** `Prefetch(keys)` on `Database` (relative to the committed state),
 `Proposal` and `Revision` (relative to that view), mirrored in the Rust core
-as one writer operation (R19, §3), `AuthWal::prefetch(&mut self, view,
+as one writer operation (R19, §3), `RightCash::prefetch(&mut self, view,
 keys)` with `view` the handle or `None` for the committed state, because a
 hint writes the target's policy. Advisory: a wrong hint costs work, never
 correctness; a hint on a node other than the precomputation's target does
 nothing, unless the node is a live child of the target (or, with no live
 target, the head or a live child of it), which retargets (§9.2); no-op after
-`Close` and with speculation off. On a hint, auth_wal resolves the node
+`Close` and with speculation off. On a hint, right_cash resolves the node
 (one registry hold), retargets if the rules say so, and feeds every key to
 the target's policy (§9.2); the hint returns after the policy call (R17).
 
@@ -1484,7 +1484,7 @@ pub trait StorageEngine<K, V>: Send + Sync + 'static {
 }
 ```
 
-Everything auth_wal reads from or proposes on storage goes through a
+Everything right_cash reads from or proposes on storage goes through a
 proposal handle (a node's pinned view), so the engine interface has no
 revision type, no engine-level read, propose or revision lookup (R20 removed
 them with the `is_committed` probe and the proof stubs; `head()?.propose(..)`
@@ -1533,7 +1533,7 @@ provide:
 4. `propose` on a **committed** handle proposes on the engine's committed
    state, provided the handle's revision is the engine's current one by
    identity both **before and after** the call, and returns
-   `ProposalOrphaned` otherwise; it never panics. auth_wal proposes on
+   `ProposalOrphaned` otherwise; it never panics. right_cash proposes on
    committed handles on two paths: the plain proposal of a child whose
    parent's pinned view is committed (a child of the head, or of a live node
    that inherited the head's view), on the writer thread, where the check
@@ -1543,7 +1543,7 @@ provide:
    being committed, as a chained proposal and never on the committed path,
    and a step proposed on it after the commit takes the committed path with
    the right root (§9.2), so the before-and-after check is a backstop that
-   keeps **auth_wal the engine's sole writer** a true invariant: no proposal
+   keeps **right_cash the engine's sole writer** a true invariant: no proposal
    on a stale view is accepted as a step. Finalization can also be the
    worker's first proposal, using the same committed-handle checks.
    The decision between chaining and the committed path is the
@@ -1563,7 +1563,7 @@ provide:
    proposal handles remain. The firewood adapter
    keeps its `Arc<Db>` only inside a proposal's live state and drops it at
    commit; the re-based committed view keeps a `Weak<Db>` for item 4, which
-   does not pin. auth_wal's `Close` relies on this: the committed node keeps
+   does not pin. right_cash's `Close` relies on this: the committed node keeps
    its pinned view for the instance's lifetime (§8), and `Close` only has to
    join the worker, whose latest view holds the steps (live proposals), first; the
    Go layer waits for its outstanding handles before calling `Close`, and a
@@ -1699,7 +1699,7 @@ on one thread (the since-removed `sync_primitives` micro-benchmark): a parking_l
 hold 14 ns, a read-write lock read guard 19 ns, a set-once cell read 0.6 ns,
 an atomic load 0.4 ns, an `Arc` clone and drop 12 ns.
 
-- *Ownership first.* The writer (`AuthWal`, every state-changing method
+- *Ownership first.* The writer (`RightCash`, every state-changing method
   `&mut self`, §3) owns the precomputation's target, the worker handle,
   the storage engine, the configuration, the root terms and the poisoned
   and closed flags; the type system
@@ -1713,7 +1713,7 @@ an atomic load 0.4 ns, an `Arc` clone and drop 12 ns.
   read it (reads never check one, R20); handles hold only their node (§8).
 - *No lock on reads.* A node's snapshot and pinned storage view are
   immutable (§8), so a handle's `Get` and the engine read behind it take no
-  lock of auth_wal's and check no flag; a database-level `Get` first
+  lock of right_cash's and check no flag; a database-level `Get` first
   resolves the head under the registry lock.
 - *The registry lock* (one mutex, §8) guards the K-ring (whose newest entry
   is the head) and the live index. It exists because the mempool and RPC
@@ -1767,7 +1767,7 @@ an atomic load 0.4 ns, an `Arc` clone and drop 12 ns.
   `close` take `&mut self`; a node's committed status is registry membership
   and its lineage one weak link (§8), so no node field is ever written.
 
-There is no lock order to state: auth_wal's locks, the registry's and a
+There is no lock order to state: right_cash's locks, the registry's and a
 snapshot's policy lock, are never held together, neither nests anything (no
 engine call, no drop under them), and the engine's own locks are leaves taken
 with nothing of ours held. The worker thread takes no lock of ours: it receives requests on its
@@ -1786,12 +1786,12 @@ changing the Go side.
 Every CSV row records the engine and its identifier (including the Firewood
 hashing algorithm), row count and number of batches, Zipf exponent, cache
 size, iteration/duration limit and
-warm-up count alongside the write-set configuration. `target=auth_wal` alone
+warm-up count alongside the write-set configuration. `target=right_cash` alone
 does not identify its backend.
 
-`auth_wal/benchmark/` is a binary crate modelled on `firewood/benchmark`:
+`right_cash/benchmark/` is a binary crate modelled on `firewood/benchmark`:
 same four workloads, same key derivation (`sha256(row_id)`), same CLI flags
-where they apply, plus auth_wal knobs.
+where they apply, plus right_cash knobs.
 
 | Workload | From firewood | What it stresses here |
 |---|---|---|
@@ -1805,10 +1805,10 @@ runs a workload straight into an engine selected with `--engine
 {memory,firewood}` (firewood is the vanilla comparison point; `--dbname` and
 `--cache-memory-limit` as in firewood's benchmark, and `create` truncates
 while the other workloads reopen the database `create` left); without
-`--baseline` the workload runs through auth_wal (milestone 1). Run control:
+`--baseline` the workload runs through right_cash (milestone 1). Run control:
 `--iterations` (batches for tenkrandom/zipf/single; 0 = until
 `--duration-minutes`, firewood's rule) and `--progress-every`. For update
-workloads, after prefill and the requested warm-up, auth_wal occupancy must
+workloads, after prefill and the requested warm-up, right_cash occupancy must
 be at least the low watermark before the first measured block. Otherwise the
 run fails and asks for sufficient prefill or warm-up. A run ending before
 measurement starts also fails. CSV `start_occupancy` and the stderr measurement
@@ -1822,7 +1822,7 @@ actual eviction remains at capacity, §6.2), `--revisions` (K),
 `--speculation-rounds`, `--speculation-min-step` (default 256 distinct pending
 keys), `--speculation-margin`,
 `--firewood-commit-permits` (positive; defaults to rounds for speculative
-auth_wal, 1 for plain/baseline; must be smaller than the engine revision
+right_cash, 1 for plain/baseline; must be smaller than the engine revision
 window; recorded as the resolved `firewood_commit_permits` CSV field),
 `--hints` (emulate execution, clarification 29: the batch is cut into
 `--hint-chunks` chunks, one per emulated transaction, each hinted with
@@ -1866,7 +1866,7 @@ and includes worker shutdown, final persistence drain, and resource release. Wit
 `puts_per_commit` counts the distinct puts (786 of 2400 draws on `zipf`)
 while an unhinted run of the same seed counts the draws: compare like with
 like. The `target` column names the engine or
-`auth_wal`. What counts (clarification 31, R33): the validator's critical
+`right_cash`. What counts (clarification 31, R33): the validator's critical
 path is `Propose`, the new root, so propose latency is the figure of
 merit; `Commit` marks the proposal committed, and firewood's `commit`
 signals its persist worker and returns, so persistence is asynchronous.
@@ -1900,7 +1900,7 @@ the paths in situ.
    part of it that came back, driven by the policy's marks rather than a
    fresh prediction); whether one worker thread per instance suffices (R17; a
    pool would have to keep the one precomputation's steps in order, §9.2);
-   and whether auth_wal should spawn the thread at all (clarification 13):
+   and whether right_cash should spawn the thread at all (clarification 13):
    firewood spawns its own (a rayon pool of 16 for parallel proposal
    hashing, one thread per top-level child, and a persistence thread), and
    its FFI proposes on the calling goroutine's thread, so a step's hashing
@@ -2007,7 +2007,7 @@ the paths in situ.
    failure window; (b) a squash commit that merges a chain's node stores into
    one revision, removing the window-sizing cost; (c) hashing deferred or
    shared across a chain so a path touched by several steps is hashed once;
-   (d) a native warm-path call (no longer needed by auth_wal's hints, R26;
+   (d) a native warm-path call (no longer needed by right_cash's hints, R26;
    the benchmark baseline's read-through would use it); (e) a
    restore op, `Restore(key)` in a proposal's batch, that puts back the
    value the proposal's base holds for `key` (or deletes it) without the
@@ -2056,11 +2056,11 @@ the paths in situ.
    public API costs 1.3 ms at 10k and 20.4 ms at 100k, a 1000-op batch adds
    6–7 µs per op at either size, and an overflow evicting 51k entries takes
    370 ms (7 µs per victim, 5 of them the memory engine's own). End to end
-   (1000-op batches, K = 128, lthash) auth_wal is the same on every engine
+   (1000-op batches, K = 128, lthash) right_cash is the same on every engine
    and workload, because the fixed terms dominate: propose 26–30 ms and
    commit 6–12 ms, 23–30 commits/s, against bare firewood at 93 commits/s
    on `zipf` (propose 2.4 ms, commit 7.5 ms on the 500k-row database) and
-   37 on `create`, and the memory model at 116–130; auth_wal keeps 95 % of
+   37 on `create`, and the memory model at 116–130; right_cash keeps 95 % of
    `zipf` puts in place and sends 50 storage ops per commit instead of
    1000, and holds 2.8–3.4 GB against the baselines' 69–185 MB. The
    alternatives at 100k, per 1000 ops: a persistent ordered map
@@ -2083,7 +2083,7 @@ the paths in situ.
    `zipf` propose + commit 2.7 + 8.1 ms per batch at 100k rows (85
    commits/s), 4.0 + 13.7 ms at 1M (54 commits/s, commit p99 90 ms);
    `tenkrandom` 7.5 + 15.0 ms (43 commits/s) and 11.8 + 24.7 ms (27
-   commits/s). auth_wal's own cost does not: `zipf` propose 9.1 ms and
+   commits/s). right_cash's own cost does not: `zipf` propose 9.1 ms and
    commit 1.4 ms at 100k (89 commits/s with lru-write, 93 with fifo; 90 %
    of puts in place, 101 storage ops per commit), 10.9 + 1.6 ms at 1M (72
    commits/s, 86 % in place, 152 storage ops per commit); `tenkrandom`
@@ -2098,12 +2098,12 @@ the paths in situ.
    spreads it), and 450–630 MB RSS against 170–200 MB (K × 10k copies).
    At 10M rows (prefill 400 s either way; the trie no longer fits the
    192 MB node cache) the gain holds but narrows: `zipf` baseline 5.2 +
-   14.2 ms (49 commits/s) against auth_wal 13.7 + 2.7 ms (56 commits/s,
+   14.2 ms (49 commits/s) against right_cash 13.7 + 2.7 ms (56 commits/s,
    84 % in place, 178 storage ops per commit), +14 %; `tenkrandom` 15.4 +
    27.9 ms (23 commits/s) against 23.9 + 14.8 ms (25 commits/s), +10 %,
-   with auth_wal's propose p99 at 110–118 ms and its `tenkrandom` commit
+   with right_cash's propose p99 at 110–118 ms and its `tenkrandom` commit
    p99 at 105 ms. From 1M to 10M rows firewood's per-batch cost grew by a
-   tenth to a fifth while auth_wal's grew by a third: the set keeps the hot
+   tenth to a fifth while right_cash's grew by a third: the set keeps the hot
    keys, whose paths firewood would have cached anyway, and sends the cold
    ones, whose paths it must read from disk, in 6000-key eviction batches;
    fewer ops, but the expensive ones. That is the case for milestone 2's
@@ -2309,9 +2309,9 @@ the paths in situ.
 ## 13. Layout and milestones
 
 ```
-auth_wal/
+right_cash/
   Cargo.toml                  workspace root; lib (rlib; milestone 4 adds staticlib), features: firewood, ethhash
-  src/lib.rs                  AuthWal<K, V, C, P, S> (the writer, &mut self) and Reader, both over Arc<Shared>; Config, Stats
+  src/lib.rs                  RightCash<K, V, C, P, S> (the writer, &mut self) and Reader, both over Arc<Shared>; Config, Stats
   src/types.rs                Key/Value bounds, Hash, Digest, EMPTY_ROOT, BatchOp<K, V>, Error
   src/set.rs                  Snapshot (the whole set at one node: sorted records, value arena) and its one-pass batch application, Entry<V>, EntryRef, Entries
   src/policy/{mod,fifo,lru_write}.rs   EvictionPolicy (writes / hint_writes / predicted / reset_hints / validate / state_digest), per-policy prediction state and reconciliation, split_order, merge_index, order_digest, params_digest, validate_watermarks; the v0 policies on sorted arrays, each with its own watermarks
@@ -2328,17 +2328,17 @@ auth_wal/
   docs/                       this directory
 ```
 
-Milestone 4 adds `src/ffi/` (the C ABI, cbindgen → `auth_wal.h`, names
-`auth_wal_*`, behind a feature `ffi` that also enables `firewood`), the
+Milestone 4 adds `src/ffi/` (the C ABI, cbindgen → `right_cash.h`, names
+`right_cash_*`, behind a feature `ffi` that also enables `firewood`), the
 `staticlib` crate type and the Go package `ffi` mirroring qmdb-ffi's files;
 the stubs that stood for them were removed in the review of 2026-11-02.
 
-Library tests are organized in `src/tests/`, with modules for policy rules,
-WAL behavior, speculation, injected faults, persistence, storage contracts,
-and consensus encodings. `common.rs` contains shared fixtures. The library
-loads them through its `#[cfg(test)] mod tests`; private implementation tests
-remain inline in their own modules. Test organization does not change the
-public API or expose internals solely for testing.
+Library tests are organized in `src/tests/`, with modules for the read and
+write path, policy rules, speculation, injected faults, persistence, storage
+contracts, and consensus encodings. `common.rs` contains shared fixtures.
+The library loads them through its `#[cfg(test)] mod tests`; private
+implementation tests remain inline in their own modules. Test organization
+does not change the public API or expose internals solely for testing.
 
 Milestones
 
@@ -2353,7 +2353,7 @@ Milestones
    unit tests shared across policies and schemes (`src/tests/`: the §6.1
    list, the §8 lineage rules, the revision window, a differential test
    against a reference map, a firewood smoke test); the benchmark's
-   auth_wal target (`WriteSet`). Reviewed on 2026-11-02 (§14).
+   right_cash target (`WriteSet`). Reviewed on 2026-11-02 (§14).
 2. **Done (2026-10-29, R29–R32).** Speculative eviction and prefetch hints
    (§9): `build_step`, `New` accepts `speculate`, predictions that outlive
    the block (R31), the local precomputation trigger (R39), §9.3 tests 1–5 (test 6
@@ -2710,7 +2710,7 @@ committed handle proposes on the committed state with the root check inside
 the adapter (item 4), and `prefetch` moved to `ReadView`, so the worker holds
 no engine reference (§10); the lock inventory is the registry mutex and the
 firewood handle lock, with every hold listed (§10) and the primitives
-measured (`sync_primitives`). Skeleton: `AuthWal` (writer) and `Reader`,
+measured (`sync_primitives`). Skeleton: `RightCash` (writer) and `Reader`,
 `Registry` replaces `ProposalTree`, `Node` loses `snapshot`, `parent` and
 `speculation` and gains `ancestors`, `LinkSlot`/`Chains` replace
 `ChainSlot`/`SpeculativeChain`'s mutex, the adapters implement `head` and
@@ -3053,7 +3053,7 @@ committed), so the first-link race of v18 to v22 no longer exists and
 contract item 4 is a backstop.
 Skeleton: `speculate.rs` rewritten (`Speculation`, `WorkerJob` with
 `Flush`, `LinkWorker::flush`, `finish` returning the reverts and the ops);
-`AuthWal` holds one `speculation` and a `retarget` helper; the chain sweep
+`RightCash` holds one `speculation` and a `retarget` helper; the chain sweep
 and the chain helpers are gone.
 
 Round 34 (2026-10-28), two reviewers on v23. No design blocker in the state
@@ -3174,7 +3174,7 @@ v26 (2026-10-29, R27, clarification 24). The owner found the split between
 the `Pipeline` state struct and the `Worker` handle misleading and restated
 the model: the worker manages the speculative side of the engine and takes
 two kinds of request, a batch of ops and a block end; the interface for
-auth_wal is `submit` and `finish` (block-wait for the latest view); a step
+right_cash is `submit` and `finish` (block-wait for the latest view); a step
 is built from everything queued, merged into one write set. Applied: the
 queue is plain data under the lock, `Worker` is the interface (`submit`,
 `finish`, `reset`, `shutdown`), the thread body `run` holds the worker
@@ -3217,20 +3217,20 @@ target with the four monomorphizations and the engine window from
 round is pending. First release-mode numbers (milestone 1, 2026-10-29; 1000-op batches,
 capacity 10k, watermark 5k, `lthash`, one machine, no profiling yet). On
 the memory model engine, `create` (every key new, nothing can stay):
-baseline propose 4.9 ms per batch, auth_wal 12.7 ms (p99 59 ms on the
-eviction blocks); `zipf`: baseline 5.5 ms, auth_wal 7.6 ms with 91 % of
+baseline propose 4.9 ms per batch, right_cash 12.7 ms (p99 59 ms on the
+eviction blocks); `zipf`: baseline 5.5 ms, right_cash 7.6 ms with 91 % of
 puts landing in place and 50 storage ops per commit instead of 1000. On
 firewood, the engine of record: `create` baseline propose 4.0 ms and commit
-11.7 ms (61 commits/s), auth_wal propose 11.0 ms (p99 61 ms) and commit 3.8
+11.7 ms (61 commits/s), right_cash propose 11.0 ms (p99 61 ms) and commit 3.8
 ms (66 commits/s: the work moves from commit to propose, four commits in
 five carry no storage proposal); `zipf` from a fresh database with 50
 warm-up batches: baseline propose 2.5 ms and commit 1.1 ms (219 commits/s),
-auth_wal lru-write propose 8.9 ms (p99 32 ms) and commit 0.06 ms (103
+right_cash lru-write propose 8.9 ms (p99 32 ms) and commit 0.06 ms (103
 commits/s) with 90 % in-place updates and 101 storage ops per commit, fifo
 8.2 ms and 111 commits/s. Reading: the set's own cost per 1000-op batch at
 10k entries is about 8 ms, roughly 2 ms of copy and 6 µs per op, ten times
 the 0.5 µs per-write target, and larger than firewood's own propose cost
-per op (2.5 µs), so on this workload auth_wal halves throughput even while
+per op (2.5 µs), so on this workload right_cash halves throughput even while
 cutting storage ops tenfold. The per-op suspects, to profile before any
 change: two lattice expansions per write (about 1.5 µs), three ordered-map
 operations in the policy, the benchmark's `Vec<u8>` values cloned at every
@@ -3244,7 +3244,7 @@ policies. Ran the four end-to-end comparisons at capacity 100k (watermark
 50k, 1000-op batches, K = 128, lthash; `zipf` over 500k rows with 1000
 warm-up and 1000 measured batches; fresh firewood database per run) and a
 micro-benchmark that isolates each O(n) term of a proposal and measures the
-alternatives at 10k, 100k and 1M (§12.13). Result: auth_wal is identical on
+alternatives at 10k, 100k and 1M (§12.13). Result: right_cash is identical on
 every engine and workload, 26–30 ms propose and 6–12 ms commit, 23–30
 commits/s, because the fixed terms of the copy dominate (20 ms in propose,
 8 ms to drop the retired snapshot at commit, 28 ms before the first op; 1.4
@@ -3267,7 +3267,7 @@ grows, so the set's lattice hash and copy may win. The benchmark driver
 gained `--prefill` (§11): a workload's `rows()` keys are inserted
 in-process before the measurement, through the write set when there is one
 (v0 requires a fresh engine, §1), and the firewood target truncates when
-prefilling. Results at 100k and 1M rows in §12.13: auth_wal is ahead of
+prefilling. Results at 100k and 1M rows in §12.13: right_cash is ahead of
 bare firewood on both workloads at both sizes, by 5–10 % on `zipf` at 100k
 rows and 33 % at 1M, by about a quarter on `tenkrandom`, and the margin
 grows with the trie because firewood's per-batch cost grows while the
@@ -3342,7 +3342,7 @@ cold paths), plain bulk 46.5 (p99 124) + 1.8 ms with 2120 ops, speculative
 bulk 20.2 (p99 41) + 70.7 ms (p99 338 ms) with `F` empty (every victim
 reused) and the worker at 32 ms per block, speculative incremental 44.5
 (p99 50) + 76.6 ms over 8 steps with `F` empty, plain incremental 51.1 +
-3.0 ms. Hints cost auth_wal 0.11–0.35 ms per 80 keys (1.4–4 µs per key:
+3.0 ms. Hints cost right_cash 0.11–0.35 ms per 80 keys (1.4–4 µs per key:
 the order walk and the entry clones under the policy lock), 3–10 ms per
 block, below the baseline's warm reads.
 
@@ -3434,7 +3434,7 @@ R33, and a configuration knob rather than the cascade/squash change of
 set's work and the two chained engine proposals dominate" was half right,
 the two proposals being the tail step and a free `F`, and its "(3) the
 extra engine commit cancels the gain" is moot under R33; clarification
-28's "auth_wal ahead of bare firewood by a third at 1M rows" held in the
+28's "right_cash ahead of bare firewood by a third at 1M rows" held in the
 no-gap setting, where firewood's persistence of one block contends with
 the next block's propose (13.7 ms); with execution gaps and hints, bare
 firewood proposes in 7.1 ms and the plain set in 14.5–17.8 ms. (5) Next,
@@ -3687,7 +3687,7 @@ to be kept in step by eye); policy and scheme names come from clap;
 `GlobalOpts::watermark()`/`trigger()` replace two copies of the R16
 default; the `TestRunner` trait and four unit structs are `TestName`
 methods over one `run_loop` (`workload.rs`) called from `workloads.rs`
-(`--warmup-batches` now applies to all three update workloads); `TargetStats` is `auth_wal::Stats`;
+(`--warmup-batches` now applies to all three update workloads); `TargetStats` is `right_cash::Stats`;
 the worker line prints the dropped steps and ops, the step failures, the
 fallbacks and the panics, and the CSV gained `step_failures` and
 `fallbacks` (`log` has no sink in the benchmark, so a run whose steps the
@@ -3812,7 +3812,7 @@ check compares parent hashes, so a chain built on revision B and
 committed after a same-root no-op revision B' makes B' and the chain's
 first link both free B's root node; later allocations reuse it and
 overwrite a live node (37 wrong reads of 40 in the reproduction; the
-control, the chain committed before the no-op, read right). auth_wal's
+control, the chain committed before the no-op, read right). right_cash's
 writer never commits such a chain (`after_commit` resets the chain after
 any other commit, and a lost line fails `ParentUncommitted`), so
 production was safe by the writer's flow while the contract, the model
@@ -3828,7 +3828,7 @@ backends, with the child still readable and a fresh `head` proposing.
 Also: the lattice known answer now goes through `LtHash`'s own `empty`,
 `apply` and `commitment` (it had bypassed the scheme and its private
 domain string, so a changed domain passed), and the memory engine's root
-is pinned too (`ENGINE_ID` and the storage root enter auth_wal's root on
+is pinned too (`ENGINE_ID` and the storage root enter right_cash's root on
 that engine); `in_place_updates` counts a present key the block rewrites
 and then evicts (it was skipped by the victim branch; the benchmark's
 hit rate only). Tests added from the reviewer's scratch work: a kept
@@ -3961,7 +3961,7 @@ Actual eviction, root encodings, and the worker protocol are unchanged.
 
 Firewood commit permits are exposed through the existing backend option.
 The adapter default remains 1; the benchmark selects rounds for speculative
-auth_wal and 1 otherwise, supports an override, and reports the resolved
+right_cash and 1 otherwise, supports an override, and reports the resolved
 setting. Earlier measurements used one permit unless stated otherwise.
 
 The focused Zipf comparison used one release trial per configuration, each
@@ -4019,7 +4019,7 @@ backend commit and generation publication. A deterministic regression test
 covers that interval; seven focused tests pass in each hash mode.
 
 The comparison repeats the earlier full matrix: Zipf and mixed writes,
-bare Firewood/plain auth_wal/speculative auth_wal, three independent seeds
+bare Firewood/plain right_cash/speculative right_cash, three independent seeds
 per combination. Each trial prefills 1M rows, warms up for 50 blocks, and
 measures 500 blocks. Watermarks remain 70%/90%, minimum step is the new
 default 256, the chain budget is 30, and speculation uses 32 permits.
@@ -4028,7 +4028,7 @@ during measurement and close. The initial partial matrix is retained separately
 and excluded after the adapter concurrency correction; final comparisons use
 one corrected build and new seeds throughout.
 
-All 18 final trials completed, totaling 9,000 measured blocks. Every auth_wal
+All 18 final trials completed, totaling 9,000 measured blocks. Every right_cash
 trial started at or above the low watermark and evicted during measurement;
 reported failures, fallbacks, panics, and dropped work were zero. The table
 shows medians of three per-trial measurements, in milliseconds.
@@ -4036,15 +4036,15 @@ shows medians of three per-trial measurements, in milliseconds.
 | Workload | Target | Propose mean | Propose p99 | Commit mean | API time/block |
 |---|---|---:|---:|---:|---:|
 | Zipf | Bare Firewood | 5.329 | 6.914 | 0.160 | 14.841 |
-| Zipf | auth_wal plain | 3.722 | 31.064 | 0.070 | 3.804 |
-| Zipf | auth_wal speculative | 1.793 | 6.006 | 0.197 | 3.476 |
+| Zipf | right_cash plain | 3.722 | 31.064 | 0.070 | 3.804 |
+| Zipf | right_cash speculative | 1.793 | 6.006 | 0.197 | 3.476 |
 | Mixed writes | Bare Firewood | 11.697 | 13.625 | 0.900 | 33.820 |
-| Mixed writes | auth_wal plain | 11.741 | 24.197 | 0.741 | 12.660 |
-| Mixed writes | auth_wal speculative | 5.250 | 43.000 | 0.606 | 8.179 |
+| Mixed writes | right_cash plain | 11.741 | 24.197 | 0.741 | 12.660 |
+| Mixed writes | right_cash speculative | 5.250 | 43.000 | 0.606 | 8.179 |
 
 API time includes hints, Propose, and Commit, but excludes artificial execution
-gaps and close. Bare Firewood reads hinted paths; speculative auth_wal updates
-predictions and submits worker operations, while plain auth_wal does no
+gaps and close. Bare Firewood reads hinted paths; speculative right_cash updates
+predictions and submits worker operations, while plain right_cash does no
 speculative hint work. These costs therefore represent different hint behavior.
 Commit still measures queue acceptance, including any backpressure, rather
 than durable persistence. Independent seeds make these unpaired comparisons.
@@ -4056,7 +4056,7 @@ tracing is needed to attribute the tails. Zipf's remaining policy writes
 average 0.492 ms/block and digest plus commitment work 0.662 ms/block.
 
 Speculative peak RSS remains approximately 1,140 MiB, versus 215–217 MiB
-for plain auth_wal. Sampling shows most of that footprint already resident
+for plain right_cash. Sampling shows most of that footprint already resident
 when measurement starts. These measurements do not distinguish live
 allocations from allocator retention or isolate the effect of 32 permits.
 Memory profiling and a smaller-permit comparison remain future work.

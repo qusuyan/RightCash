@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Experiment 1: auth_wal across Zipf exponents.
+"""Experiment 1: right_cash across Zipf exponents.
 
-zipf on a 1M-row firewood, bare firewood vs plain auth_wal vs auth_wal with
+zipf on a 1M-row firewood, bare firewood vs plain right_cash vs right_cash with
 precomputation, one line per target over the exponent. Panels: propose
 latency, mean and p99 (the bar figures' panel, over the exponent).
 Median over seeds, band = min-max. The table also gives prefetch

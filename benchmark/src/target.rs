@@ -1,17 +1,17 @@
 //! What a workload drives: a storage engine on its own (the baseline, with
-//! vanilla firewood as the comparison point) or auth_wal in front of one
+//! vanilla firewood as the comparison point) or right_cash in front of one
 //! (`WriteSet`). Both expose the same operations so the workloads and the
 //! report do not care which is running.
 
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use auth_wal::policy::EvictionPolicy;
-use auth_wal::storage::{StorageEngine, StorageProposal};
-use auth_wal::timings::{CommitTimings, ProposeTimings};
-use auth_wal::types::BatchOp;
-use auth_wal::vc::VectorCommitment;
-use auth_wal::{AuthWal, Reader, Stats};
+use right_cash::policy::EvictionPolicy;
+use right_cash::storage::{StorageEngine, StorageProposal};
+use right_cash::timings::{CommitTimings, ProposeTimings};
+use right_cash::types::BatchOp;
+use right_cash::vc::VectorCommitment;
+use right_cash::{Reader, RightCash, Stats};
 
 use crate::{BenchKey, BenchValue};
 
@@ -34,7 +34,7 @@ pub trait Target {
     /// the time spent in the call.
     fn prefetch(&mut self, keys: &[BenchKey]) -> Duration;
 
-    /// The counters the report derives its ratios from: auth_wal's own
+    /// The counters the report derives its ratios from: right_cash's own
     /// `Stats`. A bare engine fills `total_storage_ops` and `puts` and
     /// leaves the rest zero (it has no set).
     fn stats(&self) -> Stats;
@@ -101,16 +101,16 @@ impl<S: StorageEngine<BenchKey, BenchValue>> Target for Baseline<S> {
     }
 }
 
-/// auth_wal in front of a storage engine: every batch is one `propose` on
+/// right_cash in front of a storage engine: every batch is one `propose` on
 /// the committed state and one `commit`, like one block; hints go to
-/// `AuthWal::prefetch` on the committed state.
+/// `RightCash::prefetch` on the committed state.
 pub struct WriteSet<C, P, S>
 where
     C: VectorCommitment<BenchKey>,
     P: EvictionPolicy<BenchKey>,
     S: StorageEngine<BenchKey, BenchValue>,
 {
-    wal: AuthWal<BenchKey, BenchValue, C, P, S>,
+    cache: RightCash<BenchKey, BenchValue, C, P, S>,
     reader: Reader<BenchKey, BenchValue, C, P, S>,
 }
 
@@ -120,9 +120,9 @@ where
     P: EvictionPolicy<BenchKey>,
     S: StorageEngine<BenchKey, BenchValue>,
 {
-    pub fn new(wal: AuthWal<BenchKey, BenchValue, C, P, S>) -> Self {
-        let reader = wal.reader();
-        Self { wal, reader }
+    pub fn new(cache: RightCash<BenchKey, BenchValue, C, P, S>) -> Self {
+        let reader = cache.reader();
+        Self { cache, reader }
     }
 }
 
@@ -134,21 +134,21 @@ where
 {
     fn apply(&mut self, batch: Vec<BatchOp<BenchKey, BenchValue>>) -> Result<BatchTiming, Box<dyn Error>> {
         let t0 = Instant::now();
-        let proposal = self.wal.propose(None, batch, None)?;
+        let proposal = self.cache.propose(None, batch, None)?;
         let t1 = Instant::now();
-        self.wal.commit(proposal)?;
+        self.cache.commit(proposal)?;
         let t2 = Instant::now();
         Ok(BatchTiming {
             propose: t1 - t0,
             commit: t2 - t1,
-            propose_detail: Some(self.wal.last_propose_timings()),
-            commit_detail: Some(self.wal.last_commit_timings()),
+            propose_detail: Some(self.cache.last_propose_timings()),
+            commit_detail: Some(self.cache.last_commit_timings()),
         })
     }
 
     fn prefetch(&mut self, keys: &[BenchKey]) -> Duration {
         let t0 = Instant::now();
-        self.wal.prefetch(None, keys);
+        self.cache.prefetch(None, keys);
         t0.elapsed()
     }
 
@@ -157,7 +157,7 @@ where
     }
 
     fn finish(&mut self) -> Result<(), Box<dyn Error>> {
-        self.wal.close()?;
+        self.cache.close()?;
         Ok(())
     }
 }

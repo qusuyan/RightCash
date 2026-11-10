@@ -6,12 +6,12 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use auth_wal::Stats;
-use auth_wal::timings::{CommitTimings, ProposeTimings};
-use auth_wal::types::BatchOp;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Geometric};
+use right_cash::Stats;
+use right_cash::timings::{CommitTimings, ProposeTimings};
+use right_cash::types::BatchOp;
 use sha2::{Digest, Sha256};
 
 use crate::report::{Breakdown, Measurements, mean, p99};
@@ -49,7 +49,7 @@ pub fn updates(start: u64, count: u64, value: BenchValue) -> impl Iterator<Item 
 /// then one batch from `next` (given the batch number) per turn until the
 /// stop rule (firewood's: `--iterations` batches when set, else the
 /// duration), the recorder reset after `--warmup-batches`, and the
-/// measurements. Auth_wal must hold at least the low watermark before the
+/// measurements. RightCash must hold at least the low watermark before the
 /// first measured block; insufficient prefill/warm-up is an error.
 pub fn run_loop(
     target: &mut dyn Target,

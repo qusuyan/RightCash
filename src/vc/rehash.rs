@@ -12,7 +12,7 @@ use crate::set::EntryRef;
 use crate::types::{Digest, Key, len_prefix};
 use crate::vc::{VectorCommitment, item_fields};
 
-const DOMAIN: &str = "auth_wal/rehash";
+const DOMAIN: &str = "right_cash/rehash";
 
 /// Bytes reserved per entry before serialising: three length prefixes, the
 /// tag, a 32-byte key and a 32-byte value; the buffer grows past it.

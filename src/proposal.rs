@@ -170,7 +170,7 @@ where
 /// what `Revision(root)` resolves to; qmdb-ffi's `Proposal` and `Revision`
 /// are both this type. Read-only (`get`, `root`); committing it,
 /// proposing on it and hinting through it are writer operations that take
-/// the handle as an argument (`AuthWal::commit(&mut self, handle)` consumes
+/// the handle as an argument (`RightCash::commit(&mut self, handle)` consumes
 /// it, design §3, R19). A plain newtype: no counter, no flag (the Go layer
 /// counts its outstanding handles, R20). `Send + Sync`; dropping it releases
 /// the node, which is freed when no handle and no ring entry holds it (the

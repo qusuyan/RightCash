@@ -25,7 +25,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::types::{Digest, EMPTY_ROOT, Hash, len_prefix};
 
-pub const DOMAIN: &[u8] = b"auth_wal/v1";
+pub const DOMAIN: &[u8] = b"right_cash/v1";
 
 /// The preimage's static terms (design §7.3): computed once at `new` from
 /// the scheme, the policy and the engine and kept on the writer; no node

@@ -79,15 +79,15 @@ fn known_answers_for_the_encodings() {
     let expected = [
         (
             "lattice value",
-            "a6ee9510061e24bf1ce9102373303a3b57a34b3a334391f4f40997dd9beb2a66",
+            "4cca5e242b9c1f87e8ca4da85a3603d7149c842a5b646a900188181809840088",
         ),
         (
             "lattice tombstone",
-            "1b786b4d7483232acaac8768c4bdd65e7c1f949e52c27d0eef810d077c56ac1a",
+            "a1138820fcb718b4e9bbeafb1887bb5b33b0927fd6afe29b4731f1ad216fb685",
         ),
         (
             "rehash",
-            "c0f53ba41d38411087747723b70c9d3891cf1bc9df93839bc8b4d3a0dafeccd0",
+            "ab49bef49aed8c0744cff2961df943190f6ef635e276cd2352668b2609b30981",
         ),
         (
             "merkle",
@@ -95,23 +95,23 @@ fn known_answers_for_the_encodings() {
         ),
         (
             "merkle-blake3",
-            "97a775388674769d8e4c94d9202dcdd59edd0fa09bb790c0a6c5edfd7a3f4b40",
+            "a40b0b5e19c017c1df5f391de8cee01f78db6512053e380010387b56b98612ff",
         ),
         (
             "merkle-blake3 params",
-            "e0a619d30b8033f8d50741b8e793f05ae056d64374b48da513d1fde8eb53b1bd",
+            "771f08a6c27f3530b0ebfd40dd09e756a9559b017d91e4a15c9fb0bbc8ea9f4c",
         ),
         (
             "merkle-blake3 empty",
-            "42c857c5b9c6a7991a716b8ffd0dea790b015dc91e4b80d4228a99f83a96dbe2",
+            "73cc7e467ab6b16fb29f4be8fbfa74b4cfbbf308cced68b74f82ef3d4e719732",
         ),
         (
             "root",
-            "2700bf8ef876785482b3cd8d5f450bc5e5f59c2873cf49130322b558b8e56c13",
+            "3ce7c1f4f180ebdadbfe764677d332e2e87cd2bfdd3564c7d1a79a3f530d3969",
         ),
         (
             "memory root",
-            "171488d0abe82d0401050bbab94c5c5ea9448d058718f9f4c520fddc87535706",
+            "47575d88c4a7fb674c8054ebb5428d731eb0027cd9d59b1a3805c09e345cc2a6",
         ),
     ];
     assert_eq!(actual, expected);

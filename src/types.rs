@@ -71,14 +71,14 @@ pub(crate) fn len_prefix(len: usize) -> [u8; 4] {
 /// digest, a metadata hash (design §7.3).
 pub type Digest = [u8; ROOT_LENGTH];
 
-/// A 32-byte root wrapper used for both combined auth_wal roots and adapter
+/// A 32-byte root wrapper used for both combined right_cash roots and adapter
 /// storage roots. The type does not distinguish those domains; callers must
 /// track which kind they hold. A combined root authenticates more than the
 /// storage trie alone. No `Default`: zero bytes are not the empty-root sentinel.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, StdHash, Debug)]
 pub struct Hash(pub [u8; ROOT_LENGTH]);
 
-/// Sentinel for auth_wal's height-zero initial state and a backend's empty
+/// Sentinel for right_cash's height-zero initial state and a backend's empty
 /// storage state. A supplied nonempty snapshot has a combined root immediately,
 /// before its first commit. Uses Ethereum's empty-root constant
 /// `keccak256(rlp(""))`, matching `qmdb-ffi` (design §3, §7.3).

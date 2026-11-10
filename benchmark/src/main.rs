@@ -1,13 +1,13 @@
 //! Benchmark driver modelled on `firewood/benchmark` (design §11).
 //!
 //! Same four workloads and key derivation (`sha256(row_id)`), the same
-//! inherited flags, plus auth_wal knobs. Every run prints a CSV header and one
+//! inherited flags, plus right_cash knobs. Every run prints a CSV header and one
 //! record to stdout (progress goes to stderr), so sweeps over capacity,
 //! policy, speculation and hints can be plotted directly.
 //!
 //! Targets: `--baseline` runs the workload straight into a storage engine
 //! (`--engine memory` or `--engine firewood`, the vanilla comparison point);
-//! without it the workload runs through auth_wal in front of that engine
+//! without it the workload runs through right_cash in front of that engine
 //! (`WriteSet`), with the policy, scheme and knobs given.
 
 use std::error::Error;
@@ -15,15 +15,15 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use auth_wal::policy::{EvictionPolicy, Fifo, LruWrite};
-use auth_wal::storage::{MemoryConfig, MemoryStorage, StorageEngine};
-use auth_wal::vc::VectorCommitment;
-use auth_wal::vc::lthash::LtHash;
-use auth_wal::vc::merkle::Merkle;
-use auth_wal::vc::merkle_blake3::MerkleBlake3;
-use auth_wal::vc::rehash::Rehash;
-use auth_wal::{AuthWal, Config, Consensus, Local};
 use clap::{Parser, Subcommand, ValueEnum};
+use right_cash::policy::{EvictionPolicy, Fifo, LruWrite};
+use right_cash::storage::{MemoryConfig, MemoryStorage, StorageEngine};
+use right_cash::vc::VectorCommitment;
+use right_cash::vc::lthash::LtHash;
+use right_cash::vc::merkle::Merkle;
+use right_cash::vc::merkle_blake3::MerkleBlake3;
+use right_cash::vc::rehash::Rehash;
+use right_cash::{Config, Consensus, Local, RightCash};
 
 mod report;
 mod target;
@@ -66,13 +66,13 @@ pub struct GlobalOpts {
     pub cache_memory_limit: NonZeroUsize,
     #[arg(
         long,
-        help = "Firewood revisions allowed to await persistence; defaults to speculation-rounds for speculative auth_wal runs, otherwise 1. Must be less than the engine revision window"
+        help = "Firewood revisions allowed to await persistence; defaults to speculation-rounds for speculative right_cash runs, otherwise 1. Must be less than the engine revision window"
     )]
     pub firewood_commit_permits: Option<NonZeroU64>,
     #[arg(
         short,
         long,
-        default_value = "auth_wal_benchmark_db",
+        default_value = "right_cash_benchmark_db",
         help = "Firewood database directory"
     )]
     pub dbname: PathBuf,
@@ -99,7 +99,7 @@ pub struct GlobalOpts {
     )]
     pub baseline: bool,
 
-    // ---- auth_wal knobs (design §11) ----
+    // ---- right_cash knobs (design §11) ----
     #[arg(
         long,
         default_value_t = 10_000,
@@ -122,7 +122,7 @@ pub struct GlobalOpts {
     pub vc: VcArg,
     #[arg(
         long,
-        default_value_t = auth_wal::vc::merkle_blake3::DEFAULT_BRANCHING,
+        default_value_t = right_cash::vc::merkle_blake3::DEFAULT_BRANCHING,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..),
         help = "Branching factor of `--vc merkle-blake3` (at least 2)"
     )]
@@ -199,7 +199,7 @@ pub struct GlobalOpts {
     #[arg(
         long,
         default_value_t = 0,
-        help = "Batches to run before measuring (tenkrandom/zipf/single); auth_wal occupancy must then be at least the low watermark"
+        help = "Batches to run before measuring (tenkrandom/zipf/single); right_cash occupancy must then be at least the low watermark"
     )]
     pub warmup_batches: u64,
     #[arg(
@@ -315,10 +315,10 @@ impl TestName {
     }
 }
 
-/// The auth_wal configuration from the flags (design §11): the capacity is
+/// The right_cash configuration from the flags (design §11): the capacity is
 /// consensus, the rest local; the engine window is `engine_window` (design
 /// §8).
-fn wal_config(g: &GlobalOpts) -> Config {
+fn cache_config(g: &GlobalOpts) -> Config {
     Config {
         consensus: Consensus { capacity: g.capacity },
         local: Local {
@@ -344,8 +344,8 @@ where
         P: EvictionPolicy<BenchKey>,
         S: StorageEngine<BenchKey, BenchValue>,
     {
-        let set = auth_wal::set::Snapshot::empty(vc, policy, config.consensus.capacity)?;
-        Ok(Box::new(WriteSet::new(AuthWal::new(config, engine, set)?)))
+        let set = right_cash::set::Snapshot::empty(vc, policy, config.consensus.capacity)?;
+        Ok(Box::new(WriteSet::new(RightCash::new(config, engine, set)?)))
     }
     // `--high-watermark` only schedules precomputation (design §6.2).
     let low = g.watermark();
@@ -367,7 +367,7 @@ where
 }
 
 /// The engine window a run needs (design §8): `K` for a bare engine, else
-/// what auth_wal's settings need on an engine of type `S`.
+/// what right_cash's settings need on an engine of type `S`.
 fn window<S: StorageEngine<BenchKey, BenchValue>>(config: &Config, baseline: bool) -> usize {
     if baseline {
         config.local.revisions
@@ -378,7 +378,7 @@ fn window<S: StorageEngine<BenchKey, BenchValue>>(config: &Config, baseline: boo
 
 fn build_target(args: &Args) -> Result<Box<dyn Target>, Box<dyn Error>> {
     let g = &args.global_opts;
-    let config = wal_config(g);
+    let config = cache_config(g);
     match g.engine {
         EngineArg::Memory => {
             let engine = MemoryStorage::<BenchKey, BenchValue>::new(MemoryConfig {
@@ -393,12 +393,12 @@ fn build_target(args: &Args) -> Result<Box<dyn Target>, Box<dyn Error>> {
         }
         #[cfg(feature = "firewood")]
         EngineArg::Firewood => {
-            use auth_wal::storage::{FirewoodConfig, FirewoodStorage};
+            use right_cash::storage::{FirewoodConfig, FirewoodStorage};
             let mut cfg = FirewoodConfig::new(g.dbname.clone());
             // `create` starts from scratch; the other baseline workloads run
             // on the database `create` left behind, as in firewood's
             // benchmark, unless `--prefill` builds the rows in-process.
-            // auth_wal requires a fresh engine (design §1, §12.6), so the
+            // right_cash requires a fresh engine (design §1, §12.6), so the
             // write-set target always starts from scratch and its workloads
             // build their rows themselves (`--prefill`, `--warmup-batches`).
             cfg.truncate = args.test_name == TestName::Create || !g.baseline || g.prefill;

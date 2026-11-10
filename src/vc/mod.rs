@@ -80,6 +80,6 @@ pub trait VectorCommitment<K: Key>: Clone + Send + Sync + 'static {
     ///
     /// Incremental schemes use their state and may ignore the iterator.
     /// Whole-set schemes consume `entries`; they do not sort or deduplicate
-    /// it. The resulting digest is one term of the combined auth_wal root.
+    /// it. The resulting digest is one term of the combined right_cash root.
     fn commitment<'a>(&mut self, entries: impl ExactSizeIterator<Item = (&'a K, EntryRef<'a>)>) -> Digest;
 }

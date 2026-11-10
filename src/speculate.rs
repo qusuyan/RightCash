@@ -4,7 +4,7 @@
 //! prefetch hints during block execution; the final proposal puts back every
 //! misprediction so the storage state equals the plain path's. On a
 //! state-function engine (firewood, `MemoryStorage`) nothing here is
-//! consensus-visible; `AuthWal::new` rejects speculation on other engines
+//! consensus-visible; `RightCash::new` rejects speculation on other engines
 //! (design §9.3).
 //!
 //! The policy chooses predictions and final corrections; the writer supplies
@@ -127,7 +127,7 @@ pub(crate) struct Worker<K: Key, V: Value, S: StorageEngine<K, V>> {
 impl<K: Key, V: Value, S: StorageEngine<K, V>> Worker<K, V, S> {
     /// Start on the initial target's storage view. `rounds` caps all proposals
     /// on a chain, reserving one slot for its final refinement. Both limits
-    /// must be positive (validated by AuthWal::new).
+    /// must be positive (validated by RightCash::new).
     pub(crate) fn spawn(
         base: StorageView<K, V, S>,
         counters: Arc<Counters>,
@@ -137,7 +137,7 @@ impl<K: Key, V: Value, S: StorageEngine<K, V>> Worker<K, V, S> {
         let (tx, rx) = channel();
         let thread_counters = counters.clone();
         let handle = std::thread::Builder::new()
-            .name("auth_wal-worker".to_owned())
+            .name("right_cash-worker".to_owned())
             .spawn(move || run(base, rx, thread_counters, min_step, rounds))?;
         Ok(Self {
             tx: Some(tx),
@@ -262,7 +262,7 @@ impl<K: Key, V: Value, S: StorageEngine<K, V>> Chain<K, V, S> {
         }))
         .map_err(|_| {
             counters.worker_panics.fetch_add(1, Ordering::Relaxed);
-            log::error!("auth_wal worker: a proposal panicked; the chain is disabled until reset");
+            log::error!("right_cash worker: a proposal panicked; the chain is disabled until reset");
             WorkerError::Panicked
         })
         .and_then(|result| result.map_err(|error| WorkerError::Storage(Arc::new(error))));

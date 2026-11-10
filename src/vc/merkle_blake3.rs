@@ -17,7 +17,7 @@
 //!   that level into the top would add a single-child node whenever a level
 //!   has exactly one or exactly `b` hashes; this is the usual rule without it.)
 //!
-//! The commitment is BLAKE3 `derive_key` (domain `auth_wal/merkle-blake3`)
+//! The commitment is BLAKE3 `derive_key` (domain `right_cash/merkle-blake3`)
 //! over `u64 LE` entry count ‖ top (32 zero bytes for the empty set). The
 //! distinct leaf and node keys keep a leaf from being read as a node; the
 //! count fixes the shape, and `b` enters the root through `params_digest`.
@@ -43,10 +43,10 @@ use crate::types::{Digest, Key, len_prefix};
 use crate::vc::blake3_lanes::{LANES, MAX_LEN, keyed_hash_lanes};
 use crate::vc::{VectorCommitment, item_fields};
 
-const DOMAIN: &str = "auth_wal/merkle-blake3";
-const LEAF_DOMAIN: &str = "auth_wal/merkle-blake3 leaf";
-const NODE_DOMAIN: &str = "auth_wal/merkle-blake3 node";
-const PARAMS_DOMAIN: &str = "auth_wal/merkle-blake3 params";
+const DOMAIN: &str = "right_cash/merkle-blake3";
+const LEAF_DOMAIN: &str = "right_cash/merkle-blake3 leaf";
+const NODE_DOMAIN: &str = "right_cash/merkle-blake3 node";
+const PARAMS_DOMAIN: &str = "right_cash/merkle-blake3 params";
 
 /// Default branching factor: a full node hashes 16 × 32 = 512 bytes, eight
 /// 64-byte blocks, half of one 1 KiB BLAKE3 chunk (any `b` up to 32 keeps a

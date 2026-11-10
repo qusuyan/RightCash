@@ -1,4 +1,4 @@
-# auth_wal TODO
+# right_cash TODO
 
 Items deliberately deferred. Design references are to `01-design.md`.
 
@@ -27,7 +27,7 @@ Future changes, in order of value:
    the window-sizing cost and the per-step revision records.
 3. **Hashing shared across a chain**: defer or share path hashing so a path
    touched by several steps (or written then reverted) is hashed once.
-4. **Native warm-path call** (no longer needed by auth_wal's hints, R26;
+4. **Native warm-path call** (no longer needed by right_cash's hints, R26;
    the benchmark baseline's read-through would use it) under
    `CacheReadStrategy::All` (design §9.4).
 5. **Commit by reference** (`Proposal::commit(&self)`, or a handle that stays
@@ -53,7 +53,7 @@ Future changes, in order of value:
    the kept marks are re-sent on the new base and their paths hashed again
    by the next chain's first step).
 
-## auth_wal
+## right_cash
 
 - The `ffi` feature, `src/ffi/` and the `staticlib` crate type arrive with
   milestone 4 (the stubs that stood for them were removed in the review of
@@ -145,11 +145,11 @@ Future changes, in order of value:
 - **Resolved upstream: parent identity (design §10 item 3).** Firewood
   v0.9.0 checks parent revision identity and absorbs same-root commits.
   The earlier hash-only check and double-free reproduction no longer
-  describe upstream. Adapter generations retain auth_wal's stricter rule
+  describe upstream. Adapter generations retain right_cash's stricter rule
   that even a no-op commit supersedes the old head; contract tests cover it.
 - **Set structure for a larger set (open, clarifications 27–28, design
   §12.13, §12.15).** At the default 10k the copy wins once the trie is
-  large (auth_wal ahead of bare firewood from 100k rows on), so R20
+  large (right_cash ahead of bare firewood from 100k rows on), so R20
   stands. At capacity 100k the full copy per proposal costs about 28 ms per
   block before the first op and 3.4 GB for 128 revisions. If the set is to
   grow: persistent maps (keeps R20's properties, about 7 µs per op) or a

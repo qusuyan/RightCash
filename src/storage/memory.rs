@@ -19,7 +19,7 @@ use crate::lattice::LatticeAccumulator;
 use crate::storage::{StorageEngine, StorageProposal};
 use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
 
-const TAG: &str = "auth_wal/memory-storage";
+const TAG: &str = "right_cash/memory-storage";
 
 #[derive(Clone, Debug)]
 pub struct MemoryConfig {
@@ -442,7 +442,7 @@ impl<K: Key, V: Value> StorageProposal<K, V> for MemoryProposal<K, V> {
         let mut engine = self.inner.engine.write();
         if chain.iter().any(|p| p.committed.load(Ordering::Acquire)) {
             return Err(Error::Storage(
-                "an ancestor was committed concurrently (auth_wal serialises commits)".to_owned(),
+                "an ancestor was committed concurrently (right_cash serialises commits)".to_owned(),
             ));
         }
         let oldest = chain.first().expect("non-empty");

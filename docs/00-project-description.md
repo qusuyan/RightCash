@@ -1,4 +1,4 @@
-# auth_wal: project description (as given)
+# right_cash: project description (as given)
 
 Recorded 2026-10-25. This is the problem statement as provided by the project
 owner; `01-design.md` is the design derived from it. When the two disagree,
@@ -6,15 +6,15 @@ this file is the requirement and the design is what needs fixing.
 
 ## Context
 
-`auth_wal/` is an **authenticated set of recent writes**. It sits in the middle
+`right_cash/` is an **authenticated set of recent writes**. It sits in the middle
 of the blockchain validators (`Avax-pEVM/` and `libevm/`) and the storage layer
 (`qmdb-ffi/` or `firewood/`).
 
 ## Statement
 
-> `auth_wal/` will use the same interface as `qmdb-ffi/` and `firewood/` so that
+> `right_cash/` will use the same interface as `qmdb-ffi/` and `firewood/` so that
 > the validators do not require additional code changes. The idea is simple: we
-> keep a set of recently written key-value pairs in `auth_wal/`. If the
+> keep a set of recently written key-value pairs in `right_cash/`. If the
 > validator writes a key, it first adds the value into the set. If the key is
 > already in the set, it simply updates the value. When the set is full, some
 > key-value pairs will be evicted and written to the storage layer. Your design
@@ -329,7 +329,7 @@ Clarification 13 (2026-10-28), two questions on the speculation mechanism:
 > eviction by setting the value back to the original value. Please make sure
 > you can do that with the current shape.
 
-> 2. currently `auth_wal` launches new threads to track precomputations. Do
+> 2. currently `right_cash` launches new threads to track precomputations. Do
 > we have to work with new threads? Can you take a look at `firewood/`,
 > particularly how it computes Merkle hashes in parallel and how its
 > background persisting worker is implemented, to see if it is possible to
@@ -340,9 +340,9 @@ back the value the parent's pinned view holds, from before any link, or
 deletes the key, and the differential test now names the case. Firewood
 spawns its own threads (a rayon pool for parallel proposal hashing and a
 persistence thread) and its FFI proposes on the calling goroutine's thread;
-auth_wal's one worker thread only drives the sequence of link proposals,
+right_cash's one worker thread only drives the sequence of link proposals,
 whose hashing runs inside firewood. A driver model with no thread of
-auth_wal's is recorded in 01 §12.5 as an option to decide at milestone 2.)
+right_cash's is recorded in 01 §12.5 as an option to decide at milestone 2.)
 
 Clarification 14 (2026-10-28), after a walk through where the old version
 of a change is kept for a revert (the parent's immutable snapshot for the
@@ -506,12 +506,12 @@ Clarification 24 (2026-10-29), on `speculate.rs` without warm jobs:
 
 > I think the share of responsibility between `Worker` and `Pipeline`
 > looks very weird. I will refer to them as the worker and the interface
-> (for `auth_wal`) since I think the current name is misleading. Per my
+> (for `right_cash`) since I think the current name is misleading. Per my
 > understanding, the worker should be managing the storage engine. It
 > receives two types of requests: speculative eviction (a batch of
 > `SpecOp`), and a commit message indicating that we have reached a block
 > end, so just apply all the evictions and return the final `base` for
-> `auth_wal` to process the next block. Correspondingly, the interface will
+> `right_cash` to process the next block. Correspondingly, the interface will
 > also only provide these two interfaces: one to submit a batch of `SpecOp`
 > to the worker's queue, and one that block-waits for the final `base` to
 > be ready.
@@ -568,7 +568,7 @@ Clarification 27 (2026-10-29), after the milestone-1 numbers at 10k:
 proposal of R20 costs about 28 ms per block before the first op (entry and
 policy map clones 11.5 ms, the BLAKE3 policy digest 7.4 ms, the drop of
 the retired snapshot 8 ms at commit) and 3.4 GB for 128 revisions, so
-auth_wal runs at about a quarter of bare firewood's rate on every workload;
+right_cash runs at about a quarter of bare firewood's rate on every workload;
 at 10k the same terms were 1.4 ms. Two ways out are measured: path-copying
 persistent maps keep R20's properties and remove the O(n) terms but stay
 near 7 µs per op; a mutable base with undo records reaches 0.1–0.2 µs per
@@ -582,7 +582,7 @@ stays recorded as what a larger set would cost.)
 Clarification 28 (2026-10-29), correcting the reading of clarification 27:
 
 > I need to correct this: I want to experiment where there are 100k
-> key-value pairs already in the storage. The `auth_wal` capacity stays at
+> key-value pairs already in the storage. The `right_cash` capacity stays at
 > 10k. The key thing is computing the merkle root is expensive when the
 > storage contains a lot of keys. In this setup, replacing Merkle updates
 > with lattice hash and copying may actually lead to performance gains.
@@ -671,8 +671,8 @@ critical path and the figure of merit; `Commit` marks the proposal
 committed, and firewood's own commit signals its persist worker and
 returns, so the engine's persistence is asynchronous and commit latency is
 reported but not optimised (01 §11). Warm-up ahead of the final root
-computation is a TODO item (`docs/TODO.md`, auth_wal section). The
-breakdown: `AuthWal::last_propose_timings` and `last_commit_timings`
+computation is a TODO item (`docs/TODO.md`, right_cash section). The
+breakdown: `RightCash::last_propose_timings` and `last_commit_timings`
 return where the last call spent its time phase by phase (the entry and
 policy copies, the ops, the policy's `writes`, the victims' removal, the
 policy digest, the wait for the worker,
@@ -841,7 +841,7 @@ overrides. The library continues to require explicit consensus parameters.
 
 Clarification 37 (2026-11-03), on constructor ownership:
 
-> On `new()`, `auth_wal` should take the entire set since the set and the
+> On `new()`, `right_cash` should take the entire set since the set and the
 > policy should match key space.
 
 The owner also requested support for populated initial sets. R40: the Rust
@@ -907,5 +907,5 @@ between clean-shutdown recovery and future crash durability.
 | R37 | **One step at a time, each measured.** The clarification-32 proposals are applied one by one, each step measured with the breakdown on both workloads against the previous step | 01 §12.17, §14 |
 | R38 | **Review rounds until clean.** Independent reviews of two kinds, simplification (designs that could be simpler, leftovers of experiments never reverted) and general correctness, repeated until the reviewers have no further comments; every finding applied, or recorded with the reason (a requirement it would contradict, or the owner's call) | 01 §14 "Review of 2026-11-02", `docs/TODO.md` |
 | R39 | **High watermark starts precomputation only.** Predict a capacity-to-low batch at the high watermark, refine it with hints, retain immutable proposals across non-evicting blocks, and evict only above capacity. High watermark is local and excluded from roots; low watermark remains consensus. | 01 §6.1, §6.2, §9.1 |
-| R40 | **Construct from the complete set.** `AuthWal::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement. | 01 §3, §4, §7.3 |
+| R40 | **Construct from the complete set.** `RightCash::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement. | 01 §3, §4, §7.3 |
 | R41 | **Clean-shutdown persistence and recovery.** Save the latest committed snapshot on close and recover it at startup with matching storage, preserving policy order and the combined root. | 01 §3, §12.6 |

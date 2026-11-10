@@ -3,15 +3,15 @@
 
 Experiments (all on firewood, prefilled, hinted blocks; see PROTOCOL):
 
-  zipf_sweep   zipf with several exponents: bare firewood, plain auth_wal,
-               speculative auth_wal (precomputation).
+  zipf_sweep   zipf with several exponents: bare firewood, plain right_cash,
+               speculative right_cash (precomputation).
   policy       tenkrandom and zipf, precomputation on: LRU-write vs FIFO,
                with bare firewood as the baseline.
   vc           tenkrandom and zipf, precomputation on: rehash vs
                merkle-blake3 (b = 16); tenkrandom also runs lthash and the
                sparse merkle.
-  baseline     zipf and tenkrandom: bare firewood vs plain auth_wal vs
-               speculative auth_wal, propose and prefetch latency.
+  baseline     zipf and tenkrandom: bare firewood vs plain right_cash vs
+               speculative right_cash, propose and prefetch latency.
   watermarks   tenkrandom, precomputation on: trigger (high watermark) and
                low watermark varied one at a time around a baseline;
                per-block rows in <experiment>/blocks/.
@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BINARY = ROOT / "target" / "release" / "auth_wal-benchmark"
+BINARY = ROOT / "target" / "release" / "right_cash-benchmark"
 
 SEEDS = [101, 202, 303]
 
@@ -74,7 +74,7 @@ PLAIN = ["--policy", "lru-write", "--vc", "rehash", "--breakdown"]
 SPEC = PLAIN + ["--speculate"]
 # The watermark experiment's baseline (capacity - trigger = W, trigger - low
 # = 2W - 1 for tenkrandom's W = 2100 new entries per block), used by every
-# auth_wal configuration of experiments 1-4. Experiments 5 and 6 set their
+# right_cash configuration of experiments 1-4. Experiments 5 and 6 set their
 # own.
 WATERMARKS = ["--capacity", "10000", "--high-watermark", "7900", "--low-watermark", "3701"]
 
@@ -86,8 +86,8 @@ def configs():
 
     # 1. Zipf exponent sweep; exponent 0 is uniform over the rows.
     for s in ["0.0", "0.3", "0.6", "0.8", "1.0", "1.2", "1.4", "1.6", "2.0"]:
-        for name, flags in [("firewood", FIREWOOD), ("auth_wal", PLAIN + WATERMARKS),
-                            ("auth_wal_spec", SPEC + WATERMARKS)]:
+        for name, flags in [("firewood", FIREWOOD), ("right_cash", PLAIN + WATERMARKS),
+                            ("right_cash_spec", SPEC + WATERMARKS)]:
             out.append(("zipf_sweep", f"s{s}-{name}", flags + ["--zipf-exponent", s], {}, "zipf"))
 
     # Experiments 2-4 run on several workloads into one directory: a config
@@ -121,8 +121,8 @@ def configs():
 
     # 4. The original comparison, propose and prefetch.
     for workload in ["zipf", "tenkrandom"]:
-        for name, flags in [("firewood", FIREWOOD), ("auth_wal", PLAIN + WATERMARKS),
-                            ("auth_wal_spec", SPEC + WATERMARKS)]:
+        for name, flags in [("firewood", FIREWOOD), ("right_cash", PLAIN + WATERMARKS),
+                            ("right_cash_spec", SPEC + WATERMARKS)]:
             out.append(("baseline", f"{workload}-{name}", flags, {}, workload))
 
     # 5. Trigger (high watermark) and low watermark on tenkrandom with
@@ -229,7 +229,8 @@ def done(path):
     if not path.exists():
         return set()
     with path.open() as f:
-        return {row["trial"] for row in csv.DictReader(f)}
+        # Trials recorded before the 2026-11-09 rename say auth_wal.
+        return {row["trial"].replace("auth_wal", "right_cash") for row in csv.DictReader(f)}
 
 
 def main():
