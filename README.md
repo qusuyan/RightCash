@@ -114,13 +114,13 @@ to run it locally.
 <!-- BENCHMARK-TABLE:START -->
 | Workload | Target | Propose mean | Propose p99 | Prefetch mean | Prefetch p99 | Commit mean | Commit p99 |
 |---|---|--:|--:|--:|--:|--:|--:|
-| `zipf` | Firewood | 5.93 ms | 14.4 ms | 264 µs | 813 µs | 213 µs | 729 µs |
-| `zipf` | RightCash | 1.77 ms | 9.03 ms | 70 µs | 613 µs | 151 µs | 1.26 ms |
-| `tenkrandom` | Firewood | 11.7 ms | 24.8 ms | 611 µs | 4.40 ms | 274 µs | 528 µs |
-| `tenkrandom` | RightCash | 3.31 ms | 9.76 ms | 105 µs | 1.83 ms | 320 µs | 945 µs |
+| `zipf` | Firewood | 3.40 ms | 4.22 ms | 227 µs | 933 µs | 164 µs | 310 µs |
+| `zipf` | RightCash | 1.48 ms | 8.05 ms | 60 µs | 919 µs | 181 µs | 1.84 ms |
+| `tenkrandom` | Firewood | 8.72 ms | 11.0 ms | 664 µs | 5.07 ms | 402 µs | 698 µs |
+| `tenkrandom` | RightCash | 4.34 ms | 25.9 ms | 102 µs | 2.96 ms | 443 µs | 1.38 ms |
 
-Seed 1582617319, the same for every row (rerun with `scripts/run_experiments.py --only readme --seed 1582617319`). 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 20 warm-up and 200 measured blocks; 128 committed revisions kept; Zipf exponent 1.2. RightCash: capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds, so its Firewood keeps 3,840 revisions for the speculative steps.
-Measured on 2026-11-15 at commit `4a229ee` on a local workstation (12th Gen Intel Core i7-12700KF, 20 threads, WSL2).
+Seed 4287636642, the same for every row (rerun with `scripts/run_experiments.py --only readme --seed 4287636642`). 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 20 warm-up and 200 measured blocks; 128 committed revisions kept; Zipf exponent 1.2. RightCash: capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds, so its Firewood keeps 3,840 revisions for the speculative steps.
+Measured on 2026-11-15 at commit `1f5e080` on a GitHub-hosted Linux runner (Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, 4 vCPUs).
 <!-- BENCHMARK-TABLE:END -->
 
 ## Documentation
