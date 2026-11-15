@@ -7,7 +7,7 @@ RightCash is an authenticated, bounded, in-memory set of recent writes that
 sits between EVM validators and an authenticated storage engine such as
 Firewood. A validator can opt in without modifying its underlying MPT
 database (or any other storage engine that keeps entries sorted by key) and
-without migrating its data to a different storage engine.
+without migrating its data to a different storage engine. 
 
 - **Writes land in the set first.** A write to a key already in the set
   updates it in place, and reads check the set before the engine, so
@@ -29,6 +29,9 @@ without migrating its data to a different storage engine.
   ahead of time, which takes engine work off the propose path.
 - **Clean-shutdown recovery.** The committed set can be checkpointed on
   close and recovered with the matching Firewood database.
+
+See [here](https://www.qusuyan.com/byzantine%20fault%20tolerance/storage%20systems/2026/11/06/right-cash.html)
+for my blog post. 
 
 ## Usage
 
