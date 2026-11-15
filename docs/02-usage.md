@@ -210,16 +210,29 @@ The figures show propose latency (mean and p99), one panel per workload;
 prefetch latency is in the summary CSVs. `--blog` renders the dark,
 captionless PNGs for the blog post.
 
-The README's performance table is the `vc` experiment's merkle-blake3
-trials (about ten minutes on one machine):
+The README's performance table comes from one more experiment, `readme`,
+which the default run leaves out. It runs bare firewood and right_cash with
+LRU-write and merkle-blake3 (the commitment experiment's configuration) on
+`zipf` and `tenkrandom`. It uses the same rows and hints, but one random
+seed per run (shared by the four trials, so both targets see the same
+workload), 20 warm-up + 200 measured blocks, and the default 128 revisions rather than
+the commitment experiment's 8. With 8, right_cash's Firewood window (8 × 30
+speculation rounds) fills around block 240, and from then on `tenkrandom`'s
+propose p99 is 40–70 ms instead of 7 ms, nearly all of it reads. With 128,
+every 100-block window of a full run gives the same mean and p99, so 200
+blocks suffice. The four trials take about four minutes, most of it the
+1M-row prefill:
 
 ```bash
-scripts/run_experiments.py --only vc --match merkle-blake3 --out /tmp/readme-bench
-scripts/readme_benchmark.py /tmp/readme-bench/vc/results.csv --readme README.md --host "<machine>"
+scripts/run_experiments.py --only readme --out /tmp/readme-bench
+scripts/readme_benchmark.py /tmp/readme-bench/readme/results.csv --readme README.md --host "<machine>"
 ```
 
-Use a fresh `--out`: the runner skips trials already recorded there. The
-table is the median over the seeds, and the script refuses a missing seed.
+The runner prints the seed it drew, and the table states it. Pass `--seed N`
+to rerun a given run, for example a CI run. Use a fresh `--out`: the runner
+skips trials already recorded there, and an interrupted run resumes with the
+seed it recorded. The table script refuses a configuration that lacks the
+others' seed.
 The [Benchmark workflow](../.github/workflows/benchmark.yml) runs both on
 every push to `main` that changes the code (or by hand, from the Actions
 tab). It keeps the CSVs and trial logs as a run artifact and commits the

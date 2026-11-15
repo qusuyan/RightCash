@@ -1,8 +1,9 @@
 name: Benchmark
 
-# Runs the README's benchmark (RightCash with LRU-write and merkle-blake3 on
-# zipf and tenkrandom, the `vc` experiment's parameters) and, on main,
-# commits the refreshed table to README.md.
+# Runs the README's benchmark (`run_experiments.py --only readme`: bare
+# Firewood vs RightCash with LRU-write and merkle-blake3 on zipf and
+# tenkrandom, four short trials) and, on main, commits the refreshed table
+# to README.md.
 on:
   push:
     branches: [main]
@@ -43,15 +44,15 @@ jobs:
       - name: Build the benchmark
         run: cargo build --release --locked -p right_cash-benchmark
 
-      - name: Run zipf and tenkrandom with LRU-write and merkle-blake3
-        run: python3 scripts/run_experiments.py --only vc --match merkle-blake3 --out "$RUNNER_TEMP/bench"
+      - name: Run Firewood and RightCash on zipf and tenkrandom
+        run: python3 scripts/run_experiments.py --only readme --out "$RUNNER_TEMP/bench"
 
       - name: Render the table
         run: |
           cpu="$(lscpu | sed -n 's/^Model name: *//p' | head -n1)"
           host="a GitHub-hosted ${{ runner.os }} runner (${cpu:-unknown CPU}, $(nproc) vCPUs)"
           echo "BENCH_HOST=$host" >> "$GITHUB_ENV"
-          python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/vc/results.csv" \
+          python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/readme/results.csv" \
             --commit "$GITHUB_SHA" --host "$host" --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results and logs
@@ -60,8 +61,8 @@ jobs:
         with:
           name: benchmark-results
           path: |
-            ${{ runner.temp }}/bench/vc/*.csv
-            ${{ runner.temp }}/bench/vc/logs/
+            ${{ runner.temp }}/bench/readme/*.csv
+            ${{ runner.temp }}/bench/readme/logs/
           if-no-files-found: ignore
 
       - name: Commit the table to README.md
@@ -82,7 +83,7 @@ jobs:
             fi
             fetched="$(git rev-parse origin/main)"
             git reset --hard origin/main
-            python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/vc/results.csv" \
+            python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/readme/results.csv" \
               --commit "$GITHUB_SHA" --host "$BENCH_HOST" --readme README.md > /dev/null
             if git diff --quiet -- README.md; then
               echo "README.md is up to date"

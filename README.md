@@ -97,25 +97,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Performance
 
-RightCash with the LRU-write policy and the merkle-blake3 commitment, with
-precomputation on, in front of Firewood. `zipf` updates Zipf-distributed
-keys; `tenkrandom` mixes a quarter inserts, a quarter deletes and half
-updates over a moving window. Propose builds a block's set and storage
-proposal (the critical path), prefetch is one hint call, and commit makes the
-proposal the head and commits its storage proposals to Firewood. The
+Bare Firewood against RightCash in front of the same Firewood, with the
+LRU-write policy, the merkle-blake3 commitment and precomputation on. `zipf`
+updates Zipf-distributed keys; `tenkrandom` mixes a quarter inserts, a
+quarter deletes and half updates over a moving window. Propose builds a
+block's proposal (the critical path). Prefetch is one hint call: Firewood
+warms the keys' trie paths, RightCash predicts evictions. Commit makes the
+proposal the head; for RightCash that includes committing its storage
+proposals to Firewood. The
 [Benchmark workflow](.github/workflows/benchmark.yml) reruns this table on
-every push to `main` that changes the code;
+every push to `main` that changes the code, with one short trial per row on
+a fresh random seed, stated below the table;
 [`docs/02-usage.md`](docs/02-usage.md#experiment-runner-and-plots) shows how
 to run it locally.
 
 <!-- BENCHMARK-TABLE:START -->
-| Workload | Propose mean | Propose p99 | Prefetch mean | Prefetch p99 | Commit mean | Commit p99 |
-|---|--:|--:|--:|--:|--:|--:|
-| `zipf` | 1.28 ms | 6.89 ms | 56 µs | 616 µs | 134 µs | 1.77 ms |
-| `tenkrandom` | 4.45 ms | 53.9 ms | 84 µs | 1.55 ms | 472 µs | 1.73 ms |
+| Workload | Target | Propose mean | Propose p99 | Prefetch mean | Prefetch p99 | Commit mean | Commit p99 |
+|---|---|--:|--:|--:|--:|--:|--:|
+| `zipf` | Firewood | 5.93 ms | 14.4 ms | 264 µs | 813 µs | 213 µs | 729 µs |
+| `zipf` | RightCash | 1.77 ms | 9.03 ms | 70 µs | 613 µs | 151 µs | 1.26 ms |
+| `tenkrandom` | Firewood | 11.7 ms | 24.8 ms | 611 µs | 4.40 ms | 274 µs | 528 µs |
+| `tenkrandom` | RightCash | 3.31 ms | 9.76 ms | 105 µs | 1.83 ms | 320 µs | 945 µs |
 
-Median over seeds 101, 202, 303. 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 50 warm-up and 500 measured blocks; capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds; 8 revisions; Zipf exponent 1.2.
-Measured on 2026-11-15 at commit `295511f` on a local workstation (12th Gen Intel Core i7-12700KF, 20 threads, WSL2).
+Seed 1582617319, the same for every row (rerun with `scripts/run_experiments.py --only readme --seed 1582617319`). 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 20 warm-up and 200 measured blocks; 128 committed revisions kept; Zipf exponent 1.2. RightCash: capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds, so its Firewood keeps 3,840 revisions for the speculative steps.
+Measured on 2026-11-15 at commit `4a229ee` on a local workstation (12th Gen Intel Core i7-12700KF, 20 threads, WSL2).
 <!-- BENCHMARK-TABLE:END -->
 
 ## Documentation

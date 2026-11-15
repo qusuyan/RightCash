@@ -18,6 +18,12 @@ Experiments (all on firewood, prefilled, hinted blocks; see PROTOCOL):
   watermarks_capacity
                tenkrandom, precomputation on: capacity varied with trigger
                and low watermark shifted along, so both gaps stay fixed.
+  readme       the README's table (scripts/readme_benchmark.py, run by the
+               Benchmark workflow): zipf and tenkrandom, bare firewood vs
+               right_cash with LRU-write and merkle-blake3 as in `vc` but
+               with the default 128 revisions; one random seed (--seed
+               to choose it) and 20 + 200 blocks, to keep CI short. Not
+               run by default.
 
 Each trial runs alone (latencies are the measurement), writes its full
 stdout/stderr to `<out>/<experiment>/logs/<trial>.log`, and appends its CSV
@@ -35,6 +41,7 @@ import argparse
 import csv
 import io
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -46,6 +53,28 @@ ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "target" / "release" / "right_cash-benchmark"
 
 SEEDS = [101, 202, 303]
+# Experiments that run one random seed instead of SEEDS, the same for all
+# their trials so every target sees the same workload.
+RANDOM_SEED = {"readme"}
+
+
+def recorded_seeds(results):
+    if not results.exists():
+        return set()
+    with results.open(newline="") as f:
+        return {int(row["seed"]) for row in csv.DictReader(f)}
+
+
+def seeds(experiment, out=None, seed=None):
+    """The seeds `experiment` runs. A random-seed experiment runs `seed` if
+    given; otherwise the seeds it already recorded under `out`, so an
+    interrupted run resumes with the same draw; otherwise a fresh one."""
+    if experiment not in RANDOM_SEED:
+        return SEEDS
+    if seed is not None:
+        return [seed]
+    recorded = recorded_seeds(out / experiment / "results.csv") if out else set()
+    return sorted(recorded) or [random.SystemRandom().randrange(2**32)]
 
 # The protocol shared by every trial (the 2026-11-03 setup, design §14):
 # 1M prefilled rows, 2400-op blocks hinted as 30 chunks of 80 keys with
@@ -158,21 +187,40 @@ def configs():
         out.append(("watermarks_capacity", "base" if C == base["C"] else f"C-{C}",
                     SPEC + ["--capacity", str(C), "--high-watermark", str(T),
                             "--low-watermark", str(L)] + blocks, {}, "tenkrandom"))
+
+    # 7. The README's table: experiment 3's merkle-blake3 configuration and
+    # bare firewood, shortened so the Benchmark workflow stays short: one
+    # random seed (RANDOM_SEED) and 20 warm-up + 200 measured blocks. It keeps
+    # the default 128 revisions, as experiments 2 and 4 do, not experiment
+    # 3's 8 (a memory limit of the sparse merkle): with 8, right_cash's
+    # engine window (8 x 30 rounds) fills around block 240 and tenkrandom's
+    # propose p99 rises from 7 to 40-70 ms, all of it reads. With 128,
+    # every 100-block window of a 50 + 500 run gives the same mean and p99
+    # (seed 101, 2026-11-15), so 200 blocks suffice.
+    short = {"--warmup-batches": "20", "--iterations": "220"}
+    for workload in ["zipf", "tenkrandom"]:
+        for name, flags in [
+            ("firewood", FIREWOOD),
+            ("merkle-blake3", ["--policy", "lru-write", "--vc", "merkle-blake3", "--speculate", "--breakdown"]
+             + WATERMARKS),
+        ]:
+            out.append(("readme", f"{workload}-{name}", flags, short, workload))
     return out
 
 
-def trials(experiments=None):
+def trials(experiments=None, out_dir=None, seed=None):
     """Every trial: (experiment, trial id, command line tail, workload).
     Configurations are interleaved by seed within an experiment (seed 1 of
     every configuration, then seed 2, ...), so a slow drift of the machine
-    spreads over all configurations instead of landing on one."""
+    spreads over all configurations instead of landing on one. `out_dir`
+    and `seed` resolve the seed of a random-seed experiment (`seeds`)."""
     order = experiments or ["policy", "baseline", "zipf_sweep", "vc", "watermarks", "watermarks_capacity"]
     out = []
     for exp in order:
-        for seed in SEEDS:
+        for s in seeds(exp, out_dir, seed):
             for e, cfg, flags, overrides, workload in configs():
                 if e == exp:
-                    out.append((exp, f"{cfg}-{seed}", protocol(overrides) + flags + ["--seed", str(seed)], workload))
+                    out.append((exp, f"{cfg}-{s}", protocol(overrides) + flags + ["--seed", str(s)], workload))
     return out
 
 
@@ -239,11 +287,17 @@ def main():
     ap.add_argument("--db", type=Path, default=None, help="firewood database directory (default: <out>/db)")
     ap.add_argument("--only", nargs="*", help="experiments to run")
     ap.add_argument("--match", default=None, help="only trials whose id matches this regex (e.g. '^(firewood|base)-')")
+    ap.add_argument("--seed", type=int, default=None,
+                    help=f"seed of the random-seed experiments ({', '.join(sorted(RANDOM_SEED))}), "
+                         "e.g. to rerun a CI run; default: the seed recorded under --out, else a fresh one")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     db = args.db or args.out / "db"
 
-    todo = trials(args.only)
+    todo = trials(args.only, args.out, args.seed)
+    for exp in sorted({t[0] for t in todo} & RANDOM_SEED):
+        used = sorted({t[2][t[2].index("--seed") + 1] for t in todo if t[0] == exp}, key=int)
+        print(f"{exp}: seed {', '.join(used)}", flush=True)
     if args.match:
         todo = [t for t in todo if re.search(args.match, t[1])]
     failed = []
