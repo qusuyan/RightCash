@@ -111,11 +111,11 @@ to run it locally.
 <!-- BENCHMARK-TABLE:START -->
 | Workload | Propose mean | Propose p99 | Prefetch mean | Prefetch p99 | Commit mean | Commit p99 |
 |---|--:|--:|--:|--:|--:|--:|
-| `zipf` | 1.28 ms | 6.89 ms | 56 µs | 616 µs | 134 µs | 1.77 ms |
-| `tenkrandom` | 4.45 ms | 53.9 ms | 84 µs | 1.55 ms | 472 µs | 1.73 ms |
+| `zipf` | 839 µs | 5.04 ms | 28 µs | 651 µs | 72 µs | 617 µs |
+| `tenkrandom` | 2.52 ms | 7.42 ms | 58 µs | 1.49 ms | 207 µs | 591 µs |
 
 Median over seeds 101, 202, 303. 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 50 warm-up and 500 measured blocks; capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds; 8 revisions; Zipf exponent 1.2.
-Measured on 2026-11-15 at commit `295511f` on a local workstation (12th Gen Intel Core i7-12700KF, 20 threads, WSL2).
+Measured on 2026-11-15 at commit `4a229ee` on a GitHub-hosted Linux runner (AMD EPYC 9V45 96-Core Processor, 4 vCPUs).
 <!-- BENCHMARK-TABLE:END -->
 
 ## Documentation
