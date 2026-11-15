@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes its running tests; every commit on
+# main gets a result.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Firewood v0.9.0's minimum supported Rust version.
+  RUST_TOOLCHAIN: "1.94"
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Firewood in Ethereum hashing mode, plus the README example (a doctest).
+          - name: all features
+            args: --workspace --all-features
+          # Firewood in its default MerkleDB mode (the benchmark enables it).
+          - name: default features
+            args: --workspace
+          # The library alone, on the in-memory engine.
+          - name: no default features
+            args: -p right_cash --no-default-features
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo test --locked ${{ matrix.args }}

@@ -39,6 +39,11 @@ pub mod vc;
 #[cfg(test)]
 mod tests;
 
+// Runs the README's example as a doctest; it needs the firewood backend.
+#[cfg(all(doctest, feature = "firewood"))]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};

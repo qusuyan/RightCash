@@ -1,6 +1,114 @@
 # right_cash TODO
 
-Items deliberately deferred. Design references are to `01-design.md`.
+Progress so far, then the items deliberately deferred. Design references are
+to `01-design.md`.
+
+## Progress
+
+Where the project stands (moved here from the README on 2026-11-15).
+
+Status: milestones 0–2 done and reviewed through 2026-11-03 (design §13, §14;
+test coverage includes the policies, the set and its commitment
+oracles, the three schemes, the proposal tree and its lineage rules, the
+revision window, differential tests against a reference map and against
+the plain path, the engine contract on both backends, firewood smoke
+tests). The benchmark runs through right_cash (`WriteSet`). Before it,
+milestone 0: the benchmark suite, the in-memory model engine and the
+vanilla firewood backend. First release-mode numbers (design §14, milestone
+1): on firewood's `zipf` right_cash cuts storage ops per commit from 1000 to
+100 but its own set work costs about 8 ms per 1000-op batch at 10k entries,
+so throughput halves on a 50k-row database. On a populated trie
+(clarification 28, `--prefill`) the picture inverts: with the set at 10k,
+right_cash is ahead of bare firewood from 100k rows on, by a third at 1M rows
+on `zipf`, because firewood's per-batch cost grows with the trie and the
+set's does not (design §12.13). Growing the set itself is another matter:
+at capacity 100k the per-proposal copy costs about 28 ms per block and 3.4
+GB for 128 revisions, so a larger set would need a different structure
+(design §12.13, §12.15). Milestone 2 (design §9, §14) turns speculation on:
+hints precompute a full eviction batch at a local high watermark, and
+predictions outlive the block. Actual eviction only occurs above capacity
+and drains to the low watermark; high watermark never enters the root.
+A fuzz test shows hints never change the eviction. The following historical
+measurements predate this watermark correction (design §6.2, R39). Against hinted blocks on a
+2.4M-row firewood the final proposal shrinks from 330–2120 storage ops to
+0–52 and the propose p99 from 115 to 18 ms. The per-phase latency
+breakdown (clarification 31, `--breakdown`, design §12.16 and §14) then
+shows where propose, the critical path, really goes: the set's own work
+(copy, lattice updates, eviction, policy digest) is 8.4–10.5 ms per block
+on `zipf` and 17.8–19.4 ms on `tenkrandom`, more than bare firewood's whole
+propose (7.1 and 15.9 ms) in every configuration; the engine side is cold
+puts of the evicted keys (17–22 µs each against 9 µs warm), which
+speculation moves off the path entirely once a step is built per hint
+(rounds 30, min_step 1: propose 10.2 ms on `zipf` and 20.7 ms on
+`tenkrandom`, all of it the set's own work); the chain's 14–75 ms commit
+is firewood's persistence backpressure (one unpersisted revision by
+default), off the critical path. The whole-set `rehash` commitment scheme
+(clarification 32, `--vc rehash`, design §7.2) then replaces the lattice's
+2.7–2.8 µs per item with one hash over the set, 0.7 ms per block: propose
+falls to 6.9 ms on `zipf` and 9.1 ms on `tenkrandom`, at or under bare
+firewood's. Clarification 33 then applied the proposals one step at a
+time (design §14): the policy digest from one buffer, the flat snapshot
+(sorted arrays and a value arena rebuilt by merge passes instead of B-tree
+copies) and the flat policy arrays take propose to 2.2 ms on `zipf` and
+3.1 ms on `tenkrandom`, a third and a fifth of bare firewood's; a block
+that evicts nothing now keeps the precomputed chain and the previous
+block's storage root (R35, exercised with `--hint-noise`), which
+halved the mean propose under the bulk rule with noisy hints on `zipf`, 16.4 to 9.0 ms (the 100 non-evicting blocks of 200 kept the chain and paid the set's work alone, about 2.5 ms, while the evicting half still pays about 15 ms of read-backs and reverts for the over-prediction itself, which only firewood-side changes remove, §12.10 (e)–(f)), and left `tenkrandom` unchanged, where every block evicts under either rule. The levers left are listed below. Design v19 (§14) makes every
+proposal a full copy of its parent's set (R20): a node is its snapshot, its
+pinned storage view and one weak parent link; there are no overlays, no chain
+reads and no replay-through-chain policy queries, and the redundancy pass
+that followed (design §14 v19, round 26) removed the link budget, the proof
+stubs, the capacity hook, the engine's revision type, the Rust-side handle
+count and a dozen smaller structures. Design v20 (R21) strips the derived
+state from nodes and the registry: a node's storage ownership is handle
+identity and statistics are atomics counted at `Propose`; the registry is one
+deque of committed nodes in commit order (its newest entry is the head) and a
+flat live index for `Revision(root)` on live proposals, nothing else; the
+configuration and the closed flag are writer-owned. Design v21 (R22) keeps only what consensus and the interface
+require: no lineage walk (`Commit` checks that the parent is the head,
+`Propose` builds on the head for an equal root and otherwise on the node as
+given, as firewood does), no ring clearing at close, no prefix-delete
+support in the set (rejected as QMDB rejects it), and the policy state
+carried in the set commitment's items instead of a second accumulator (its
+review showed the adapter stages children by root, so equal roots must be
+interchangeable parents). Design v22 (R23) makes the capacity a field of
+the snapshot and how much to evict the policy's own rule (a low watermark is
+the v0 policies' private parameter; the trait knows none), and drops the
+chain-carrier test. Design v23 (R24) replaces the per-node chains of link
+slots by one precomputation: the validator executes one block at a time, so
+the worker builds every link on its latest view in queue order, nothing is
+cancelled, and `Propose` waits for the queued links (R17 amended for
+`Propose` alone). Design v24 (R25) moves the prediction into the eviction
+policy: `writes` evicts and reconciles the policy's own marks, `hint_writes`
+says what to send early and what to put back, `state_digest` makes the
+policy state a root term again (a full hash per proposal), and the
+speculation machinery shrinks to a pending queue, a worker and a flush
+behind one lock. Thirty-seven review rounds (rounds 30–35 on
+R22–R24, 36–37 on R25; round 36 kept the target identity apart from the
+consumed working policy). Design v25 (R26) keeps the policy in the
+snapshot and lets hints mark it in place, drops warm jobs and the working
+copy, and calls the speculative proposals steps. Design v26 (R27) makes the
+worker the owner of the speculative side of the engine: `submit` a batch,
+`finish` a block, `reset` at a retarget; a step is the merged write set of
+everything queued. Design v27 (R28) puts the worker on a `std::sync::mpsc`
+channel; the current terminal `Finish` also carries final reconciliation
+(see `02-usage.md`, "Speculative proposal flow"). The chain state is the
+thread's own. The milestone-1 and milestone-2 implementations were
+reviewed on 2026-11-02 (clarification 34, design §14): a consensus hazard
+in R35's chain handover was fixed (the child that keeps the chain becomes
+the precomputation's target), the chain capped at `rounds` steps across
+kept blocks, and the experiments' leftovers removed; round 2 made `finish`
+answer nothing while submitted ops wait unbuilt on a full chain and the
+firewood adapter's first link hold the committed handle that pins its base
+revision, and pinned the consensus encodings with known answers; round 3
+made both engines compare a chain's base with the committed state by
+revision identity, never by root (firewood would free a node twice
+otherwise). The
+retraction of a speculative eviction (the final proposal puts back the
+value read through the parent's pinned view, design §9.1) is kept as is by
+decision; a firewood-side restore op is the recorded future change (design
+§12.10 (e), below). Next step is milestone 3 (the benchmark
+sweep).
 
 ## Firewood-side changes (R15, design §12.10)
 

@@ -246,6 +246,7 @@ def main():
     todo = trials(args.only)
     if args.match:
         todo = [t for t in todo if re.search(args.match, t[1])]
+    failed = []
     for i, (exp, trial, flags, workload) in enumerate(todo, 1):
         exp_dir = args.out / exp
         results = exp_dir / "results.csv"
@@ -267,6 +268,7 @@ def main():
         shutil.rmtree(db, ignore_errors=True)
         if proc.returncode != 0:
             print(f"  FAILED ({proc.returncode}); see logs/{trial}.log\n{proc.stderr[-2000:]}", flush=True)
+            failed.append(f"{exp}/{trial}")
             continue
         record, phases = parse(proc.stdout)
         record = {"experiment": exp, "trial": trial, "wall_s": f"{wall:.1f}", **record}
@@ -276,6 +278,10 @@ def main():
                    ["trial", "call", "phase", "mean_us", "p99_us"])
         print(f"  ok in {wall:.0f}s: propose {record['propose_mean_us']} us, "
               f"hint {record['hint_mean_us']} us", flush=True)
+    # The other trials still ran; a failure makes the exit status nonzero.
+    if failed:
+        print(f"{len(failed)} trial(s) failed: {', '.join(failed)}", flush=True)
+        return 1
 
 
 if __name__ == "__main__":

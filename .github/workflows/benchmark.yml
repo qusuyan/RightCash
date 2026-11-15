@@ -1,0 +1,104 @@
+name: Benchmark
+
+# Runs the README's benchmark (RightCash with LRU-write and merkle-blake3 on
+# zipf and tenkrandom, the `vc` experiment's parameters) and, on main,
+# commits the refreshed table to README.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "benchmark/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/run_experiments.py"
+      - "scripts/readme_benchmark.py"
+      - ".github/workflows/benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One run at a time. A running benchmark finishes; of the pushes that arrive
+# meanwhile, only the newest waits to run next.
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the benchmark
+        run: cargo build --release --locked -p right_cash-benchmark
+
+      - name: Run zipf and tenkrandom with LRU-write and merkle-blake3
+        run: python3 scripts/run_experiments.py --only vc --match merkle-blake3 --out "$RUNNER_TEMP/bench"
+
+      - name: Render the table
+        run: |
+          cpu="$(lscpu | sed -n 's/^Model name: *//p' | head -n1)"
+          host="a GitHub-hosted ${{ runner.os }} runner (${cpu:-unknown CPU}, $(nproc) vCPUs)"
+          echo "BENCH_HOST=$host" >> "$GITHUB_ENV"
+          python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/vc/results.csv" \
+            --commit "$GITHUB_SHA" --host "$host" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            ${{ runner.temp }}/bench/vc/*.csv
+            ${{ runner.temp }}/bench/vc/logs/
+          if-no-files-found: ignore
+
+      - name: Commit the table to README.md
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Apply the table to the newest main, so a push that landed while
+          # the benchmark ran is not overwritten; retry if main moves again.
+          for attempt in 1 2 3; do
+            git fetch --depth=1 origin main
+            # Numbers from older code (e.g. a re-run of an old workflow run)
+            # must not replace the table; the run for the newer code will.
+            if ! git diff --quiet "$GITHUB_SHA" origin/main -- \
+                src benchmark Cargo.toml Cargo.lock scripts/run_experiments.py; then
+              echo "main has newer code than $GITHUB_SHA; leaving README.md alone"
+              exit 0
+            fi
+            fetched="$(git rev-parse origin/main)"
+            git reset --hard origin/main
+            python3 scripts/readme_benchmark.py "$RUNNER_TEMP/bench/vc/results.csv" \
+              --commit "$GITHUB_SHA" --host "$BENCH_HOST" --readme README.md > /dev/null
+            if git diff --quiet -- README.md; then
+              echo "README.md is up to date"
+              exit 0
+            fi
+            git commit -m "Update the README benchmark table [skip ci]" -- README.md
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            # Retry only if main moved meanwhile; otherwise the push was
+            # refused (e.g. branch protection) and retrying cannot help.
+            git fetch --depth=1 origin main
+            if [ "$(git rev-parse origin/main)" = "$fetched" ]; then
+              echo "::error::push to main refused; allow github-actions[bot] to push to main, or commit the table from the job summary by hand"
+              exit 1
+            fi
+          done
+          echo "::error::main kept moving; README.md not updated"
+          exit 1
