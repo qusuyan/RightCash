@@ -898,6 +898,18 @@ storage view's root, the engine's state without right_cash. The first
 right_cash block's parent, named by the engine's root, thus resolves to the
 initial node. The rule holds for every node, not only the initial one.
 
+Clarification 41 (2026-11-16), on the supplied policy:
+
+> Please also add a check that policy state and write set contains the same
+> set of keys in `from_snapshot`.
+
+This extends R40: the constructor (`new`, and `recover`, through the shared
+`from_snapshot`) refuses a set whose policy does not track exactly the set's
+keys, tombstones included, through a new required
+`EvictionPolicy::tracks_exactly`. The builders' "fresh policy" requirement
+is thereby enforced, and an empty set has an empty policy state, as R43's
+lookup assumes.
+
 ## Requirements checklist (extracted)
 
 | # | Requirement | Design section |
@@ -941,7 +953,7 @@ initial node. The rule holds for every node, not only the initial one.
 | R37 | **One step at a time, each measured.** The clarification-32 proposals are applied one by one, each step measured with the breakdown on both workloads against the previous step | 01 §12.17, §14 |
 | R38 | **Review rounds until clean.** Independent reviews of two kinds, simplification (designs that could be simpler, leftovers of experiments never reverted) and general correctness, repeated until the reviewers have no further comments; every finding applied, or recorded with the reason (a requirement it would contradict, or the owner's call) | 01 §14 "Review of 2026-11-02", `docs/TODO.md` |
 | R39 | **High watermark starts precomputation only.** Predict a capacity-to-low batch at the high watermark, refine it with hints, retain immutable proposals across non-evicting blocks, and evict only above capacity. High watermark is local and excluded from roots; low watermark remains consensus. | 01 §6.1, §6.2, §9.1 |
-| R40 | **Construct from the complete set.** `RightCash::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement. | 01 §3, §4, §7.3 |
+| R40 | **Construct from the complete set.** `RightCash::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement and that the policy tracks exactly the set's keys (clarification 41). | 01 §3, §4, §6.1, §7.3 |
 | R41 | **Clean-shutdown persistence and recovery.** Save the latest committed snapshot on close and recover it at startup with matching storage, preserving policy order and the combined root. | 01 §3, §12.6 |
 | R42 | **Start over an engine with state; no empty-root sentinel.** `New` accepts an engine that already holds a chain's state; every combined root, the initial node's included, is the full preimage over the engine's root; engines report their empty state in their own convention. | 01 §1, §3, §4, §7.3, §10, §12.6 |
 | R43 | **An empty set answers to its storage root.** `Revision(root)` also resolves a node whose write set is empty by its storage view's root (the engine's state without right_cash), so the first block after opting in finds the initial node by the engine's root; roots themselves stay combined. | 01 §3, §7.3, §8, §12.6 |

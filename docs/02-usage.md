@@ -66,6 +66,8 @@ or `Snapshot::from_entries(vc, policy, capacity, entries)?` for a
 populated initial set. Entries are `(key, Entry::Value(value))` or
 `(key, Entry::Tombstone)`; repeated keys use the last entry. Supply a fresh
 policy to the builder, which fills its key space through the normal write path.
+`new` checks that the policy tracks exactly the set's keys and returns
+`InvalidConfig` otherwise, for example for a policy reused from another set.
 The resulting set exposes no independent policy mutation.
 
 A populated initial set is equivalent to one initial batch: height 1, with all

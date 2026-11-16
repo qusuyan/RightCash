@@ -1,0 +1,4 @@
+[submodule "RightCash-Lean"]
+	path = RightCash-Lean
+	url = https://github.com/qusuyan/RightCash-Lean.git
+	branch = main

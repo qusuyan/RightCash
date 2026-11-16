@@ -502,6 +502,28 @@ fn new_validates_supplied_set_capacity_and_empty_genesis() {
     assert!(matches!(too_large, Err(Error::InvalidConfig(_))));
 }
 
+/// A policy that was used before tracks keys the supplied set lacks:
+/// `new` refuses it rather than let it name a victim the set does not hold.
+#[test]
+fn new_refuses_a_policy_whose_keys_differ_from_the_set() {
+    use crate::set::Snapshot;
+    let engine = || MemoryStorage::<K, V>::new(MemoryConfig::default());
+    let mut used = Fifo::new(2);
+    used.writes(&[k("a")], 1, 4);
+    let set = Snapshot::empty(LtHash::new(), used, 4).unwrap();
+    assert!(matches!(
+        RightCash::new(config(4, 3), engine(), set).err(),
+        Some(Error::InvalidConfig(_))
+    ));
+    let mut used = LruWrite::new(2);
+    used.writes(&[k("a")], 1, 4);
+    let set = Snapshot::from_entries(LtHash::new(), used, 4, [(k("b"), Entry::Value(k("2")))]).unwrap();
+    assert!(matches!(
+        RightCash::new(config(4, 3), engine(), set).err(),
+        Some(Error::InvalidConfig(_))
+    ));
+}
+
 #[test]
 fn new_rejects_bad_configuration() {
     let engine = || MemoryStorage::<K, V>::new(MemoryConfig::default());

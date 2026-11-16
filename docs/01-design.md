@@ -231,7 +231,7 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 
 | Symbol | Behaviour in right_cash |
 |---|---|
-| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `RightCash::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes right_cash's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; the engine may already hold committed state (§1, R42); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
+| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `RightCash::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes right_cash's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; the engine may already hold committed state (§1, R42); a policy that does not track exactly the set's keys is refused (`InvalidConfig` from `EvictionPolicy::tracks_exactly`, §4, §6.1); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
 | `Recover` (Rust) | `RightCash::recover(config, storage, vc, policy)` restores `Local::snapshot_path` with matching, reopened storage. Validates the file and reconstructed root, installs the latest committed node, and starts fresh local speculation. See §12.6. |
 | `Update(batch)` / `UpdateWithMetadata` | `Propose` + `Commit` in one call. |
 | `Propose(batch)` / `ProposeWithMetadata` | Copies the parent's set and applies the batch to the copy (§4), the policy evicts if over capacity (§6.1), creates the storage proposal for the evicted writes, returns a `Proposal` whose `Root()` is known immediately (§8). `Root()` is a single 32-byte commitment combining the set commitment, the policy digest and the storage root (§7.3); none of them is exposed separately. Metadata is root-affecting (it enters the preimage; `None` and `Some(empty)` are distinct, as in `qmdb-ffi`) and is also carried by the node's own storage proposal when one exists (on the speculative path, the worker's final proposal; early steps never carry metadata, §9.1). |
@@ -309,7 +309,14 @@ from `(K, Entry<V>)` pairs through normal policy writes and commitment updates.
 These builders require a fresh policy with no tracked keys. They validate
 capacity and policy parameters, deduplicate entries with last-value-wins, and
 reject initial data that exceeds capacity or would be evicted. Thus no seed
-entries disappear without a corresponding storage proposal.
+entries disappear without a corresponding storage proposal. The builders do
+not themselves check that the policy was fresh; `New` and `Recover` do,
+through `EvictionPolicy::tracks_exactly` (§6.1): the policy must track
+exactly the set's keys, tombstones included, or the call fails with
+`InvalidConfig`. The set and its policy then describe one key space from the
+initial node on, which `apply` maintains and the randomized set test checks
+after every block. An empty set therefore has an empty policy state, as the
+lookup by storage root assumes (R43, §8).
 
 A nonempty initial set has height 1 and the same authenticated root as one
 initial batch with no metadata that evicts nothing, over the engine's
@@ -553,6 +560,9 @@ pub trait EvictionPolicy<K: Key>: Clone + Send + Sync + 'static {   // Clone: co
     fn predicted(&self) -> Vec<K>;
     /// Local (§9.2). Forget every mark: the node took the plain path, nothing marked is in its storage.
     fn reset_hints(&mut self);
+    /// Whether the consensus state tracks exactly `keys` (the set's, sorted, tombstones included), checked once
+    /// by `New`/`Recover` (§4): a key the set lacks could be named a victim, one the policy lacks never evicted.
+    fn tracks_exactly(&self, keys: &[K]) -> bool;
     /// The policy's parameters against the capacity (§6.2), checked once by `New`: `InvalidConfig` for a rule that
     /// could leave the set over capacity (v0: a low watermark above capacity, a high watermark outside [low, capacity]).
     fn validate(&self, capacity: usize) -> Result<()> { Ok(()) }
@@ -4212,3 +4222,31 @@ no default features: 87; plus the README doctest), with Rust 1.94;
 `cargo fmt --check` and Clippy without Firewood are clean.
 Benchmarks were not rerun: the measured paths are unchanged, and the
 benchmark's write-set target still truncates its database.
+
+### Policy key-set check (2026-11-16)
+
+Clarification 41 (extends R40): `from_snapshot`, the path shared by `New`
+and `Recover`, now refuses a set whose policy does not track exactly the
+set's keys, tombstones included (`InvalidConfig`). The builders required a
+fresh policy without checking it, so a policy reused from another set
+reached `apply`, which assumes the two describe one key space (§6.1): a key
+only the policy tracks could be named as a victim (`apply` halts), and a key
+only the set holds would never be evicted, letting the set outgrow its
+capacity. The check is a new required trait method,
+`EvictionPolicy::tracks_exactly(keys)`, required rather than defaulted so
+that a custom policy cannot skip it silently. The v0 policies answer from
+their key-sorted index in one pass, through the helper `encode_heights`
+now shares. `Snapshot::validate_policy_keys` clones the set's keys once per
+start. `Recover` was already covered by `restore_state`; the second check
+costs one pass at startup. With it, an empty set has an empty policy state,
+which the lookup by storage root (R43) assumes.
+
+Tests: `policy_keys_must_match_the_set` (both policies: a policy missing a
+key the set holds, tombstone included, and one tracking a key the set
+lacks); `new_refuses_a_policy_whose_keys_differ_from_the_set` (a used policy
+behind `Snapshot::empty` and behind `Snapshot::from_entries`); and the
+randomized set test now checks the invariant after each of its 300 blocks,
+for both policies and every scheme. `cargo test` passes in all three CI
+configurations (all features: 98; default features: 98; no default
+features: 89; plus the README doctest), with Rust 1.94; `cargo fmt --check`
+and Clippy without Firewood are clean.

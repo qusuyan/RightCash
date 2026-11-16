@@ -121,6 +121,10 @@ impl<K: Key> LruWrite<K> {
 }
 
 impl<K: Key> EvictionPolicy<K> for LruWrite<K> {
+    fn tracks_exactly(&self, keys: &[K]) -> bool {
+        super::index_tracks(&self.index, keys)
+    }
+
     fn encode_state(&self, keys: &[K]) -> Result<Vec<u8>> {
         super::encode_heights(&self.index, keys)
     }

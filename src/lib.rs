@@ -421,8 +421,9 @@ where
     /// `config.consensus.capacity`. The initial node's combined root covers
     /// the set at its own height and the engine's committed root (design
     /// §7.3). Use `recover` to reopen an existing checkpoint. Validates
-    /// configuration, set policy and revision window. The target starts dead,
-    /// with no speculative proposals.
+    /// configuration, the set's policy (its parameters, and that it tracks
+    /// exactly the set's keys, so a policy used before is refused) and the
+    /// revision window. The target starts dead, with no speculative proposals.
     pub fn new(config: Config, storage: S, snapshot: Snapshot<K, V, C, P>) -> Result<Self> {
         if let Some(path) = &config.local.snapshot_path {
             if path.try_exists()? {
@@ -475,6 +476,10 @@ where
     ) -> Result<Self> {
         config.validate()?;
         snapshot.validate(config.consensus.capacity)?;
+        // The set and its policy must describe one key space (design §6.1):
+        // otherwise the policy can name a victim the set lacks, or never
+        // evict a key it does not track.
+        snapshot.validate_policy_keys()?;
         if config.local.speculate && !S::ROOT_IS_STATE_FUNCTION {
             return Err(Error::InvalidConfig(
                 "speculative eviction requires an engine whose root is a function of state (design §9.3)".into(),

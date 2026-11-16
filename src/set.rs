@@ -241,14 +241,16 @@ where
     C: VectorCommitment<K>,
     P: EvictionPolicy<K>,
 {
-    /// Build an empty initial set. Supply a fresh policy with no tracked keys.
+    /// Build an empty initial set. Supply a fresh policy with no tracked keys
+    /// (`RightCash::new` refuses one whose tracked keys differ from the set's).
     /// Entries, policy state, and commitment subsequently stay owned together.
     pub fn empty(vc: C, policy: P, capacity: usize) -> Result<Self> {
         Self::from_entries(vc, policy, capacity, std::iter::empty())
     }
 
     /// Build an initial set from entries using a fresh policy with no tracked
-    /// keys. Repeated keys use their last entry, including tombstones. The
+    /// keys (`RightCash::new` refuses one whose tracked keys then differ from
+    /// the set's). Repeated keys use their last entry, including tombstones. The
     /// policy and commitment are populated through the normal write path.
     /// A nonempty set has height 1, equivalent to one initial write batch;
     /// an empty set has height 0. No entries may be evicted during initialization.
@@ -349,6 +351,21 @@ where
 
     pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = (&K, EntryRef<'_>)> {
         entry_refs(&self.entries, &self.arena)
+    }
+
+    /// Check that the policy tracks exactly this set's keys, tombstones
+    /// included (`EvictionPolicy::tracks_exactly`, design §6.1): `apply`
+    /// assumes it, and a set handed to `RightCash::new` may carry a policy
+    /// that was used before. `InvalidConfig` otherwise. Clones the keys once.
+    pub(crate) fn validate_policy_keys(&self) -> Result<()> {
+        let keys: Vec<_> = self.entries.iter().map(|record| record.key.clone()).collect();
+        if self.policy.lock().tracks_exactly(&keys) {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfig(
+                "the policy's tracked keys differ from the set's keys".into(),
+            ))
+        }
     }
 
     pub(crate) fn encode_policy(&self) -> Result<Vec<u8>> {
@@ -827,9 +844,35 @@ mod tests {
             let live: usize = snapshot.entries.iter().map(|r| Arena::len(r.slot)).sum();
             assert_eq!(snapshot.arena.live, live, "block {block}: arena.live drifted");
             assert_eq!(snapshot.commitment(), fresh_digest(&vc, &snapshot), "block {block}");
+            // `apply` keeps the policy on the set's key space (design §6.1).
+            snapshot.validate_policy_keys().unwrap();
             check(&snapshot);
         }
         assert!(evicted > 0);
+    }
+
+    /// `validate_policy_keys` refuses a policy missing a key the set holds
+    /// (a tombstone included) and one tracking a key the set lacks.
+    #[test]
+    fn policy_keys_must_match_the_set() {
+        fn check<P: EvictionPolicy<K>>(fresh: impl Fn() -> P) {
+            let entries = [
+                (b"a".to_vec(), Entry::Value(b"1".to_vec())),
+                (b"b".to_vec(), Entry::Tombstone),
+            ];
+            let set = Snapshot::<K, V, _, _>::from_entries(LtHash::new(), fresh(), 4, entries).unwrap();
+            set.validate_policy_keys().unwrap();
+            let mut missing = fresh();
+            missing.writes(&[b"a".to_vec()], 1, 4);
+            *set.policy.lock() = missing;
+            assert!(matches!(set.validate_policy_keys(), Err(Error::InvalidConfig(_))));
+            let mut extra = fresh();
+            extra.writes(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()], 1, 4);
+            *set.policy.lock() = extra;
+            assert!(matches!(set.validate_policy_keys(), Err(Error::InvalidConfig(_))));
+        }
+        check(|| Fifo::new(2));
+        check(|| LruWrite::new(2));
     }
 
     #[test]
@@ -915,6 +958,9 @@ mod tests {
         }
         fn hint_writes(&mut self, _: &[K], _: usize, _: usize) -> Prediction<K> {
             unreachable!()
+        }
+        fn tracks_exactly(&self, _: &[K]) -> bool {
+            unreachable!("only `apply` sees this policy")
         }
         fn predicted(&self) -> Vec<K> {
             Vec::new()

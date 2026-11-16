@@ -51,10 +51,16 @@ pub(crate) fn params_digest(low_watermark: usize) -> Digest {
     hasher.finalize().into()
 }
 
+/// `tracks_exactly` for FIFO and LRU: whether the key-sorted `index` holds
+/// exactly `keys` (sorted, distinct), compared in one pass.
+fn index_tracks<K: Key>(index: &[(K, u64)], keys: &[K]) -> bool {
+    index.len() == keys.len() && index.iter().zip(keys).all(|((key, _), expected)| key == expected)
+}
+
 /// Snapshot encoding shared by FIFO and LRU: one u64 LE height for each
 /// snapshot key. Keys are stored once, in the snapshot's entry section.
 fn encode_heights<K: Key>(index: &[(K, u64)], keys: &[K]) -> Result<Vec<u8>> {
-    if index.len() != keys.len() || index.iter().zip(keys).any(|((key, _), expected)| key != expected) {
+    if !index_tracks(index, keys) {
         return Err(Error::InvalidSnapshot("policy and snapshot key sets differ".into()));
     }
     Ok(index.iter().flat_map(|(_, height)| height.to_le_bytes()).collect())
@@ -356,6 +362,16 @@ pub trait EvictionPolicy<K: Key>: Clone + Send + Sync + 'static {
     /// Forgets every mark (design §9.2): the proposal took the plain path,
     /// so nothing marked is in its storage. Consensus state untouched.
     fn reset_hints(&mut self);
+
+    /// Whether the consensus state tracks exactly `keys`, the set's complete
+    /// key set in sorted order, tombstones included: the set and its policy
+    /// describe one key space (design §6.1). `apply` relies on it without
+    /// checking: a key the set lacks can be named as a victim (`apply`
+    /// halts), and a key the policy lacks is never evicted, so the set can
+    /// outgrow its capacity. Checked once by `RightCash::new` and `recover`
+    /// (`Snapshot::validate_policy_keys`), which refuse a policy that was
+    /// used elsewhere. Ignores the marks.
+    fn tracks_exactly(&self, keys: &[K]) -> bool;
 
     /// The policy's own parameters against the set's `capacity` (design
     /// §6.2), checked once by `RightCash::new`: `InvalidConfig` for a rule
