@@ -114,13 +114,13 @@ to run it locally.
 <!-- BENCHMARK-TABLE:START -->
 | Workload | Target | Propose mean | Propose p99 | Prefetch mean | Prefetch p99 | Commit mean | Commit p99 |
 |---|---|--:|--:|--:|--:|--:|--:|
-| `zipf` | Firewood | 2.94 ms | 3.85 ms | 186 µs | 923 µs | 76 µs | 351 µs |
-| `zipf` | RightCash | 1.14 ms | 6.33 ms | 36 µs | 863 µs | 112 µs | 634 µs |
-| `tenkrandom` | Firewood | 7.57 ms | 9.29 ms | 687 µs | 5.44 ms | 1.12 ms | 394 µs |
-| `tenkrandom` | RightCash | 6.08 ms | 64.6 ms | 69 µs | 2.19 ms | 217 µs | 600 µs |
+| `zipf` | Firewood | 3.04 ms | 3.98 ms | 186 µs | 671 µs | 83 µs | 839 µs |
+| `zipf` | RightCash | 1.28 ms | 6.91 ms | 42 µs | 1.07 ms | 113 µs | 627 µs |
+| `tenkrandom` | Firewood | 7.90 ms | 10.0 ms | 664 µs | 4.66 ms | 136 µs | 188 µs |
+| `tenkrandom` | RightCash | 5.21 ms | 69.5 ms | 86 µs | 2.58 ms | 216 µs | 524 µs |
 
-Seed 3673195350, the same for every row (rerun with `scripts/run_experiments.py --only readme --seed 3673195350`). 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 20 warm-up and 200 measured blocks; 128 committed revisions kept; Zipf exponent 1.2. RightCash: capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds, so its Firewood keeps 3,840 revisions for the speculative steps.
-Measured on 2026-11-16 at commit `ce7dba2` on a GitHub-hosted Linux runner (AMD EPYC 9V74 80-Core Processor, 4 vCPUs).
+Seed 148983689, the same for every row (rerun with `scripts/run_experiments.py --only readme --seed 148983689`). 1,000,800 prefilled rows in firewood (`firewood/merkledb`); 2,400-op blocks, each hinted as 30 prefetch calls 1–5 ms apart; 20 warm-up and 200 measured blocks; 128 committed revisions kept; Zipf exponent 1.2. RightCash: capacity 10,000, high watermark 7,900, low watermark 3,701; merkle branching 16; 30 speculation rounds, so its Firewood keeps 3,840 revisions for the speculative steps.
+Measured on 2026-11-16 at commit `8bd3383` on a GitHub-hosted Linux runner (AMD EPYC 7763 64-Core Processor, 4 vCPUs).
 <!-- BENCHMARK-TABLE:END -->
 
 ## Documentation
