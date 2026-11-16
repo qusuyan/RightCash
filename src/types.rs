@@ -74,18 +74,11 @@ pub type Digest = [u8; ROOT_LENGTH];
 /// A 32-byte root wrapper used for both combined right_cash roots and adapter
 /// storage roots. The type does not distinguish those domains; callers must
 /// track which kind they hold. A combined root authenticates more than the
-/// storage trie alone. No `Default`: zero bytes are not the empty-root sentinel.
+/// storage trie alone. There is no shared empty-root sentinel: every combined
+/// root is a hash of its node (design §7.3), and what an engine reports for
+/// its empty state is the engine's own business (design §10). No `Default`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, StdHash, Debug)]
 pub struct Hash(pub [u8; ROOT_LENGTH]);
-
-/// Sentinel for right_cash's height-zero initial state and a backend's empty
-/// storage state. A supplied nonempty snapshot has a combined root immediately,
-/// before its first commit. Uses Ethereum's empty-root constant
-/// `keccak256(rlp(""))`, matching `qmdb-ffi` (design §3, §7.3).
-pub const EMPTY_ROOT: Hash = Hash([
-    0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e, 0x5b, 0x48, 0xe0,
-    0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
-]);
 
 /// One operation of a batch, mirroring the `ffi` `BatchOp` (design §3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,9 +141,6 @@ pub enum Error {
     PrefixDeleteUnsupported,
     #[error("database is closed")]
     Closed,
-    /// `new` requires fresh storage; use `recover` for a saved snapshot.
-    #[error("storage engine already has committed state; use recover with its snapshot")]
-    EngineNotFresh,
     /// A speculative chain failed part-way through its one-at-a-time engine
     /// commits, leaving the engine head at a state no node owns (design §9.2).
     /// `Propose`/`Commit` refuse from then on: halt rather than diverge.

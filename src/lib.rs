@@ -57,7 +57,7 @@ use crate::set::{Entries, Snapshot};
 use crate::speculate::{Counters, SpecOp, SpeculationStats, Worker, entries_to_ops};
 use crate::storage::{StorageEngine, StorageProposal};
 use crate::timings::{CommitTimings, ProposeTimings};
-use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
+use crate::types::{BatchOp, Error, Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
 /// Consensus parameters: they enter the root preimage (design §7.3) and must
@@ -292,16 +292,20 @@ where
     }
 
     /// Return the committed head's combined root under one registry hold.
-    /// Initially `EMPTY_ROOT` for an empty height-zero set, or the supplied
-    /// snapshot's combined root when initialized with existing entries.
+    /// Initially the initial node's root: the supplied set over the engine's
+    /// committed root, or the recovered checkpoint's root.
     pub fn root(&self) -> Hash {
         self.shared.registry.lock().head().root()
     }
 
     /// Read-only handle at `root`: one of the last K commits or a live
     /// proposal (design §8), resolved under one registry hold
-    /// (`Registry::lookup`: the ring, then live proposals). `RevisionNotFound`
-    /// otherwise.
+    /// (`Registry::lookup`: the ring, then live proposals). `root` may be a
+    /// node's combined root or, for a node whose write set is empty, its
+    /// storage root, the engine's state without right_cash (R43): on a chain
+    /// that opted in over an engine with state (R42), the last earlier
+    /// block's root resolves to the initial node. The handle reports the
+    /// node's combined root either way. `RevisionNotFound` otherwise.
     pub fn revision(&self, root: Hash) -> Result<Handle<K, V, C, P, S>> {
         self.shared
             .registry
@@ -409,17 +413,17 @@ where
     P: EvictionPolicy<K>,
     S: StorageEngine<K, V>,
 {
-    /// Opens the supplied set in front of fresh `storage` (design §3 New).
-    /// The set owns its entries, policy, commitment scheme and capacity;
-    /// its capacity must match `config.consensus.capacity`. A populated set
-    /// starts at its own height and authenticated root; an empty height-zero
-    /// set retains `EMPTY_ROOT`. Use `recover` to reopen an existing checkpoint.
-    /// Validates configuration, set policy, engine freshness and revision
-    /// window. The target starts dead, with no speculative proposals.
+    /// Opens the supplied set in front of `storage` (design §3 New), empty or
+    /// already holding committed state: a chain may opt in to right_cash after
+    /// running on the engine alone, and the engine's state is then what the
+    /// set's misses read (design §1). The set owns its entries, policy,
+    /// commitment scheme and capacity; its capacity must match
+    /// `config.consensus.capacity`. The initial node's combined root covers
+    /// the set at its own height and the engine's committed root (design
+    /// §7.3). Use `recover` to reopen an existing checkpoint. Validates
+    /// configuration, set policy and revision window. The target starts dead,
+    /// with no speculative proposals.
     pub fn new(config: Config, storage: S, snapshot: Snapshot<K, V, C, P>) -> Result<Self> {
-        if storage.root() != EMPTY_ROOT {
-            return Err(Error::EngineNotFresh);
-        }
         if let Some(path) = &config.local.snapshot_path {
             if path.try_exists()? {
                 return Err(Error::InvalidConfig(

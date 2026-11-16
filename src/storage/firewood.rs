@@ -50,7 +50,7 @@ use firewood_storage::{NodeHashAlgorithm, TrieHash};
 use parking_lot::RwLock;
 
 use crate::storage::{StorageEngine, StorageProposal};
-use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
+use crate::types::{BatchOp, Error, Hash, Key, Result, Value};
 
 struct Db {
     inner: Box<dyn DynDb>,
@@ -142,7 +142,7 @@ enum FwState {
     /// Committed, and the trie is empty: without `ethhash` firewood has no
     /// root hash and no view for an empty trie (with it the indexed empty
     /// revision is used instead), so every key reads as absent. Proposable
-    /// like `Committed` (a fresh engine's `head`).
+    /// like `Committed` (an empty engine's `head`).
     Empty {
         db: Weak<Db>,
         generation: u64,
@@ -167,15 +167,17 @@ pub struct FwProposal {
     committed: AtomicBool,
 }
 
+/// Firewood's root as a [`Hash`]. Under `ethhash` every trie has a root,
+/// the empty one included (Ethereum's empty-trie root); in MerkleDB mode an
+/// empty trie has none, which maps to the zero hash, as Firewood's own Go FFI
+/// reports it (`EmptyRoot`, the zero `Hash`). The two modes have distinct
+/// `ENGINE_ID`s, so the conventions never meet in a combined root.
 fn hash_from(h: Option<TrieHash>) -> Hash {
-    match h {
-        Some(h) => {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(h.as_ref());
-            Hash(out)
-        }
-        None => EMPTY_ROOT,
+    let mut out = [0u8; 32];
+    if let Some(h) = h {
+        out.copy_from_slice(h.as_ref());
     }
+    Hash(out)
 }
 
 fn trie_hash(h: Hash) -> TrieHash {
@@ -344,11 +346,9 @@ impl<K: Key, V: Value> StorageEngine<K, V> for FirewoodStorage {
         self.revisions
     }
 
+    /// After `close`, the zero hash, as Firewood's Go FFI reports it.
     fn root(&self) -> Hash {
-        self.db
-            .as_ref()
-            .map(|db| hash_from(db.root_hash()))
-            .unwrap_or(EMPTY_ROOT)
+        hash_from(self.db.as_ref().and_then(|db| db.root_hash()))
     }
 
     /// Contract item 7: the committed revision (or the empty state of a fresh
@@ -358,7 +358,7 @@ impl<K: Key, V: Value> StorageEngine<K, V> for FirewoodStorage {
         let weak = Arc::downgrade(db);
         let generation = db.generation.load(Ordering::Acquire);
         let (state, root) = match db.root_hash() {
-            None => (FwState::Empty { db: weak, generation }, EMPTY_ROOT),
+            None => (FwState::Empty { db: weak, generation }, hash_from(None)),
             Some(h) => {
                 let root = hash_from(Some(h.clone()));
                 let view = db.revision(h).map_err(fw_err)?;

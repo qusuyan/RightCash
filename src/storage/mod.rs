@@ -78,9 +78,9 @@ use crate::types::{BatchOp, Hash, Key, Result, Value};
 ///    afterwards reads through committed handles keep answering, and
 ///    `propose` on a committed handle returns `Closed`, never panics.
 /// 7. [`StorageEngine::head`] returns a committed handle at the committed
-///    root (`EMPTY_ROOT` on a fresh engine), readable like any committed
-///    proposal and proposable per item 4: `head()?.propose(..)` is the one
-///    way to propose on the committed state.
+///    root, whether the engine is empty or already holds state, readable like
+///    any committed proposal and proposable per item 4: `head()?.propose(..)`
+///    is the one way to propose on the committed state.
 pub trait StorageProposal<K: Key, V: Value>: Send + Sync + Sized {
     /// Return this handle's cached storage root. This is not right_cash's
     /// combined root and does not check whether the handle is still readable.
@@ -133,8 +133,10 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
 
     /// Stable identifier hashed into the root preimage (design §7.3), including
     /// the engine's consensus parameters (Firewood's hashing algorithm).
-    /// Every engine reports `EMPTY_ROOT` before its first commit, so without
-    /// it incompatible engines could share roots until the first eviction.
+    /// A storage root does not name the engine that produced it, while the
+    /// engine decides every later storage root; without the identifier,
+    /// incompatible engines whose current roots coincide would share
+    /// combined roots until their next storage proposal.
     const ENGINE_ID: &'static str;
 
     /// Whether the root is a function of the stored state alone (firewood,
@@ -152,8 +154,9 @@ pub trait StorageEngine<K: Key, V: Value>: Send + Sync + 'static {
     /// Size of the engine's revision window, checked against design §8.
     fn revisions(&self) -> usize;
 
-    /// Committed root. A fresh engine reports `EMPTY_ROOT` (`RightCash::new`'s
-    /// freshness check, design §1; the benchmark baseline).
+    /// Committed root, in the engine's own convention for every state, the
+    /// empty one included (no shared sentinel, design §10). `RightCash::recover`
+    /// checks it against the checkpoint's storage root.
     fn root(&self) -> Hash;
 
     /// A committed handle at the committed root (contract item 7): the

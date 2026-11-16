@@ -49,19 +49,30 @@ supersedes the previous head. The API requires owned key/value batches.
 `RightCash::new(config, storage, set)` consumes the complete
 `set::Snapshot<K, V, C, P>`: entries, policy state, commitment scheme and
 capacity. It derives root parameters from that set, and rejects a capacity
-mismatch with `config`. Storage must still be fresh.
+mismatch with `config`.
 
-Use `Snapshot::empty(vc, policy, capacity)?` for the existing empty-genesis
-behavior, or `Snapshot::from_entries(vc, policy, capacity, entries)?` for a
+Storage may be empty or may already hold committed state: a chain that has
+run on Firewood alone can opt in to right_cash later by opening the existing
+database without truncation and passing it to `new`. Reads that miss the set
+fall through to that state, and evictions land on top of it. This is a fresh
+start for right_cash, not a recovery: use `recover` to reopen a right_cash
+checkpoint. The first block after the switch names its parent by the
+engine's root: `reader.revision(engine_root)` resolves to the initial node,
+because a node whose write set is empty also answers to its storage root.
+The handle's `root()` is still the combined root.
+
+Use `Snapshot::empty(vc, policy, capacity)?` for an empty initial set,
+or `Snapshot::from_entries(vc, policy, capacity, entries)?` for a
 populated initial set. Entries are `(key, Entry::Value(value))` or
 `(key, Entry::Tombstone)`; repeated keys use the last entry. Supply a fresh
 policy to the builder, which fills its key space through the normal write path.
 The resulting set exposes no independent policy mutation.
 
-A populated initial set is equivalent to one initial batch: height 1 and a
-content-dependent root, with all initial entries retained in memory. An empty
-set remains height 0 with `EMPTY_ROOT`. Initial entries do not count as runtime
-writes in statistics. Use `RightCash::recover` to restore a prior database and
+A populated initial set is equivalent to one initial batch: height 1, with all
+initial entries retained in memory. An empty set starts at height 0. Either
+way the initial root is a full combined root over the set and the engine's
+committed root; there is no empty-root sentinel. Initial entries do not count
+as runtime writes in statistics. Use `RightCash::recover` to restore a prior database and
 its historical policy ordering.
 
 ## Clean-shutdown persistence and recovery

@@ -864,6 +864,40 @@ The set, tombstones, eviction-policy state, height, and authenticated root
 must survive. See 01 §12.6 for the file format, validation, and the boundary
 between clean-shutdown recovery and future crash durability.
 
+Clarification 39 (2026-11-16), on starting over an engine with state:
+
+> Let's remove EMPTY_ROOT once and for all. RightCash may opt-in to a new
+> storage engine when the blockchain has already operated on the
+> underlying storage engine for a while, and the underlying storage engine
+> already contains some data.
+
+R42: `New` accepts an engine that already holds committed state, and
+nothing in right_cash assumes an empty engine. The `EMPTY_ROOT` constant
+and the `EngineNotFresh` error are removed. Every combined root, the
+initial node's included, is the full preimage of 01 §7.3, so the initial
+root authenticates the engine's existing state; each engine reports its
+own empty state in its own convention. How the Go adapter decides
+initialization is left to milestone 4 (01 §12.6); finding the initial node
+at the switch is R43.
+
+Clarification 40 (2026-11-16), on finding the initial node at the switch:
+
+> I do not wish to have a simple pass through. But in the first block, the
+> validator would query the storage engine for the snapshot that
+> corresponds to the underlying storage WITHOUT `RightCash`. However, the
+> root `RightCash` sees is the storage's root combined with an empty write
+> set and policy state. So, when finding a snapshot for a given root, we
+> should check if exists a snapshot with the same root for the underlying
+> storage engine and an empty write set. You do not need to skip looking up
+> the write set as an optimization, since an emptyness check should be
+> quick.
+
+R43: roots stay combined roots (no pass-through), but a lookup by root
+(`Revision(root)`) also matches a node whose write set is empty by its
+storage view's root, the engine's state without right_cash. The first
+right_cash block's parent, named by the engine's root, thus resolves to the
+initial node. The rule holds for every node, not only the initial one.
+
 ## Requirements checklist (extracted)
 
 | # | Requirement | Design section |
@@ -909,3 +943,5 @@ between clean-shutdown recovery and future crash durability.
 | R39 | **High watermark starts precomputation only.** Predict a capacity-to-low batch at the high watermark, refine it with hints, retain immutable proposals across non-evicting blocks, and evict only above capacity. High watermark is local and excluded from roots; low watermark remains consensus. | 01 §6.1, §6.2, §9.1 |
 | R40 | **Construct from the complete set.** `RightCash::new(config, storage, set)` owns a coherent set/policy/commitment snapshot, supports seeded initialization with an authenticated root, and validates capacity agreement. | 01 §3, §4, §7.3 |
 | R41 | **Clean-shutdown persistence and recovery.** Save the latest committed snapshot on close and recover it at startup with matching storage, preserving policy order and the combined root. | 01 §3, §12.6 |
+| R42 | **Start over an engine with state; no empty-root sentinel.** `New` accepts an engine that already holds a chain's state; every combined root, the initial node's included, is the full preimage over the engine's root; engines report their empty state in their own convention. | 01 §1, §3, §4, §7.3, §10, §12.6 |
+| R43 | **An empty set answers to its storage root.** `Revision(root)` also resolves a node whose write set is empty by its storage view's root (the engine's state without right_cash), so the first block after opting in finds the initial node by the engine's root; roots themselves stay combined. | 01 §3, §7.3, §8, §12.6 |

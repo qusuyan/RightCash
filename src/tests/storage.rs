@@ -4,7 +4,7 @@
 
 use crate::storage::*;
 use crate::tests::common::{del, k, put};
-use crate::types::{BatchOp, EMPTY_ROOT, Error};
+use crate::types::{BatchOp, Error};
 
 type K = Vec<u8>;
 type V = Vec<u8>;
@@ -16,10 +16,10 @@ fn get<S: StorageEngine<K, V>>(s: &S, key: &str) -> Option<V> {
 }
 
 fn contract<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
-    // Fresh engine: EMPTY_ROOT, empty.
+    // Fresh engine: empty, its head at the engine's own empty root.
     let s = make();
-    assert_eq!(s.root(), EMPTY_ROOT);
-    assert_eq!(s.head().unwrap().root(), EMPTY_ROOT);
+    let empty = s.root();
+    assert_eq!(s.head().unwrap().root(), empty);
     assert_eq!(get(&s, "a"), None);
 
     // Propose + commit; the handle stays readable after commit (item 2); a
@@ -29,7 +29,7 @@ fn contract<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
         .unwrap()
         .propose(&[put("a", "1"), put("b", "2")], None)
         .unwrap();
-    assert_ne!(p1.root(), EMPTY_ROOT);
+    assert_ne!(p1.root(), empty);
     assert_eq!(p1.get(&k("a")).unwrap(), Some(k("1")));
     let r1 = p1.commit().unwrap();
     assert_eq!(r1, p1.root());
@@ -201,9 +201,10 @@ fn propose_is_side_effect_free<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
 }
 
 /// A commit that empties the trie leaves a readable handle (every key absent)
-/// with the empty root.
+/// with the root of a fresh engine (the root is a function of state).
 fn emptying_commit_is_readable<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
     let s = make();
+    let empty = s.root();
     s.head()
         .unwrap()
         .propose(&[put("a", "1")], None)
@@ -212,7 +213,7 @@ fn emptying_commit_is_readable<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
         .unwrap();
     let p = s.head().unwrap().propose(&[del("a")], None).unwrap();
     let root = p.commit().unwrap();
-    assert_eq!(root, EMPTY_ROOT);
+    assert_eq!(root, empty);
     assert_eq!(p.get(&k("a")).unwrap(), None);
     assert_eq!(get(&s, "a"), None);
 }
@@ -291,7 +292,7 @@ fn failed_commit_consumes_the_handle<S: StorageEngine<K, V>>(make: impl Fn() -> 
 fn head_handle<S: StorageEngine<K, V>>(make: impl Fn() -> S) {
     let s = make();
     let h0 = s.head().unwrap();
-    assert_eq!(h0.root(), EMPTY_ROOT);
+    assert_eq!(h0.root(), s.root());
     assert_eq!(h0.get(&k("a")).unwrap(), None);
     assert!(matches!(h0.commit(), Err(Error::ProposalConsumed)));
     // The genesis node's pinned view: the first proposal of an instance goes
@@ -541,6 +542,7 @@ mod firewood_backend {
     use super::*;
     use crate::storage::firewood::{FirewoodConfig, FirewoodStorage};
     use crate::tests::common::TempDir;
+    use crate::types::Hash;
 
     thread_local! {
         /// Databases this test thread created, removed by `Cleanup`.
@@ -586,5 +588,29 @@ mod firewood_backend {
         emptying_commit_is_readable(make);
         concurrent_proposes_on_one_handle(make);
         head_handle(make);
+    }
+
+    /// The adapter reports an empty trie as Firewood's Go FFI does: Ethereum's
+    /// empty-trie root under `ethhash`, the zero hash in MerkleDB mode (no
+    /// root); a closed engine reports the zero hash too.
+    #[test]
+    fn firewood_empty_root_follows_upstream() {
+        let _cleanup = Cleanup;
+        let mut s = make();
+        let empty = if cfg!(feature = "ethhash") {
+            // keccak256(rlp(""))
+            Hash([
+                0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e, 0x5b,
+                0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+            ])
+        } else {
+            Hash([0; 32])
+        };
+        assert_eq!(StorageEngine::<K, V>::root(&s), empty);
+        let head = StorageEngine::<K, V>::head(&s).unwrap();
+        assert_eq!(StorageProposal::<K, V>::root(&head), empty);
+        drop(head);
+        StorageEngine::<K, V>::close(&mut s).unwrap();
+        assert_eq!(StorageEngine::<K, V>::root(&s), Hash([0; 32]));
     }
 }

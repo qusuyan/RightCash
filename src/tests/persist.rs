@@ -6,7 +6,7 @@ use crate::policy::{Fifo, LruWrite};
 use crate::set::{Entry, Snapshot};
 use crate::storage::{MemoryConfig, MemoryStorage, StorageEngine, StorageProposal};
 use crate::types::BatchOp;
-use crate::types::{EMPTY_ROOT, Error, Hash, Result};
+use crate::types::{Error, Hash, Result};
 use crate::vc::VectorCommitment;
 use crate::vc::{lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 use crate::{Config, Consensus, Local, RightCash};
@@ -50,15 +50,14 @@ fn roundtrip<C: VectorCommitment<Vec<u8>>, P: EvictionPolicy<Vec<u8>>>(vc: C, po
         vec![put("a", "new A"), put("d", "D"), del("b")],
         vec![put("e", "E"), put("f", "")],
     ];
-    let mut first_root = EMPTY_ROOT;
+    let mut first_root = None;
     for batch in batches {
         cache.prefetch(None, &[k("false hint")]);
         let root = cache.update(batch.clone(), Some(b"block metadata")).unwrap();
         assert_eq!(root, control.update(batch, Some(b"block metadata")).unwrap());
-        if first_root == EMPTY_ROOT {
-            first_root = root;
-        }
+        first_root.get_or_insert(root);
     }
+    let first_root = first_root.unwrap();
     let saved_root = cache.reader().root();
     let discarded = cache.propose(None, vec![put("a", "uncommitted")], None).unwrap();
     cache.close().unwrap();
@@ -136,6 +135,7 @@ fn checkpoint_genesis_and_fixed_size_bytes_recover() {
         Snapshot::empty(Rehash, Fifo::new(2), 3).unwrap(),
     )
     .unwrap();
+    let initial = cache.reader().root();
     cache.close().unwrap();
     drop(cache);
     let mut cache = Cache::recover(
@@ -145,7 +145,7 @@ fn checkpoint_genesis_and_fixed_size_bytes_recover() {
         Fifo::new(2),
     )
     .unwrap();
-    assert_eq!(cache.reader().root(), EMPTY_ROOT);
+    assert_eq!(cache.reader().root(), initial);
     let root = cache
         .update(
             vec![BatchOp::Put {
@@ -182,6 +182,42 @@ fn checkpoint_genesis_and_fixed_size_bytes_recover() {
         WrongValue::recover(cfg, MemoryStorage::new(MemoryConfig::default()), Rehash, Fifo::new(2)),
         Err(Error::InvalidSnapshot(_))
     ));
+}
+
+/// A chain that opted in to right_cash over an engine with state (design
+/// §1) checkpoints its initial node like any other: the root binds the
+/// engine's root, so only the same engine state recovers it.
+#[test]
+fn checkpoint_of_the_initial_node_over_engine_state_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir.path().join("snapshot"), 3, false);
+    let used = |value: &str| {
+        let engine = memory();
+        engine
+            .head()
+            .unwrap()
+            .propose(&[put("old", value)], None)
+            .unwrap()
+            .commit()
+            .unwrap();
+        engine
+    };
+    let set = || Snapshot::empty(Rehash, LruWrite::new(2), 3).unwrap();
+    let mut cache = MemWal::new(cfg.clone(), used("x"), set()).unwrap();
+    let initial = cache.reader().root();
+    cache.close().unwrap();
+    drop(cache);
+    for other in [used("y"), memory()] {
+        assert!(matches!(
+            MemWal::recover(cfg.clone(), other, Rehash, LruWrite::new(2)),
+            Err(Error::InvalidSnapshot(_))
+        ));
+    }
+    let mut cache = MemWal::recover(cfg, used("x"), Rehash, LruWrite::new(2)).unwrap();
+    assert_eq!(cache.reader().root(), initial);
+    assert_eq!(cache.reader().stats().height, 0);
+    assert_eq!(cache.reader().get(&k("old")).unwrap(), Some(k("x")));
+    cache.close().unwrap();
 }
 
 fn saved_file(path: &Path) -> Config {

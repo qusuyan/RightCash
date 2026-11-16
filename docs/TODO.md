@@ -172,6 +172,12 @@ Future changes, in order of value:
   self`, which C cannot express; the Go package's `Proposal.Commit`,
   `Proposal.Propose` and every `Prefetch` become writer calls on the database
   handle, so the Go surface stays `qmdb-ffi`'s.
+- Without the empty-root sentinel (R42, design §7.3, §12.6), right_cash
+  never reports the Go `EmptyRoot`: the adapter port (milestone 4) needs its
+  own `Initialized()` test. `Revision` of the last pre-right_cash block root
+  (the engine's) already resolves to the initial node (R43), but the
+  handle's `Root` is the initial node's combined root, not the root asked
+  for; the port must not assume they are equal.
 
 - **Warm-up ahead of the final root computation (clarification 31, R33).**
   `Propose` is the critical path, and its engine side is cold-path puts:

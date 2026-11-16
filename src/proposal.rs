@@ -39,8 +39,9 @@ pub(crate) type StorageView<K, V, S> = Arc<<S as StorageEngine<K, V>>::Proposal>
 /// The live index's entries (`Registry::live`): root and height cached
 /// beside the weak link, so a lookup compares roots and a retirement
 /// compares heights without upgrading (nothing is dropped under the hold,
-/// design §10). An alias because the inline type trips clippy's
-/// type-complexity lint.
+/// design §10). The root is the node's combined root, or, in a second entry
+/// for an empty-set node, its storage view's root (R43). An alias because
+/// the inline type trips clippy's type-complexity lint.
 pub(crate) type LiveIndex<K, V, C, P, S> = Vec<(Hash, u64, WeakNode<K, V, C, P, S>)>;
 
 /// One node of the tree: one proposal, immutable from construction (design
@@ -159,6 +160,16 @@ where
         &self.storage_view
     }
 
+    /// The engine root this node also answers to in a lookup by root (R43):
+    /// its storage view's root while its write set is empty, for the node is
+    /// then exactly the engine's state without right_cash. On a chain that
+    /// opted in (R42), the last earlier block's root is the engine's, and
+    /// this is how it finds the initial node. `None` for a nonempty set,
+    /// tombstones included (they shadow storage). Two O(1) reads.
+    pub(crate) fn bare_root(&self) -> Option<Hash> {
+        self.snapshot.is_empty().then(|| self.storage_view.root())
+    }
+
     /// Speculative steps under this node's storage proposal (design §9.1);
     /// 0 on the plain path or with an inherited view.
     pub(crate) fn steps(&self) -> u32 {
@@ -238,7 +249,9 @@ where
     /// pinned view does not keep the engine from closing, design §10 item 6;
     /// `close` leaves the ring alone, R22). Committed roots are
     /// pairwise distinct (height is in the preimage); a lookup by root scans
-    /// from the newest entry, at most K root compares (design §10).
+    /// from the newest entry, at most K root compares plus an emptiness check
+    /// each (an empty-set node also answers to its storage root, R43; design
+    /// §10).
     ring: VecDeque<NodeRef<K, V, C, P, S>>,
     /// The live index (design §8): the live proposals as (root, height, weak
     /// link) triples, so a lookup compares roots and a retirement compares
@@ -252,8 +265,9 @@ where
     /// §9.4), which nothing else answers. Equal roots are interchangeable
     /// (design §7.3) but two distinct live nodes may share one and either
     /// may be dropped, so `lookup` returns the first still alive; dead links
-    /// are dropped by `register`/`advance`. Lookup-only: never iterated for
-    /// anything consensus-visible.
+    /// are dropped by `register`/`advance`. A node with an empty write set
+    /// has a second entry under its storage view's root (R43). Lookup-only:
+    /// never iterated for anything consensus-visible.
     live: LiveIndex<K, V, C, P, S>,
 }
 
@@ -290,10 +304,19 @@ where
     }
 
     /// Design §8 lookup order: the ring first (the committed node, scanned
-    /// newest first), then the first live node still alive under `root`. No
+    /// newest first), then the first live node still alive under `root`. A
+    /// node answers to its combined root and, while its write set is empty,
+    /// to its storage view's root (`Node::bare_root`, R43): ring nodes are
+    /// checked here (the ring holds them, so nothing is dropped under the
+    /// hold); live nodes were indexed under that root by `register`. No
     /// mutation.
     pub fn lookup(&self, root: Hash) -> Option<NodeRef<K, V, C, P, S>> {
-        if let Some(node) = self.ring.iter().rev().find(|node| node.root() == root) {
+        if let Some(node) = self
+            .ring
+            .iter()
+            .rev()
+            .find(|node| node.root() == root || node.bare_root() == Some(root))
+        {
             return Some(node.clone());
         }
         self.live
@@ -304,11 +327,20 @@ where
 
     /// Register borrowed `node` for lookup by root, after removing dead weak
     /// links. Stores only its root, height, and a weak reference; the caller
-    /// must keep the node alive. Returns `()` and may grow the index. Call once
-    /// per new node: duplicate registrations are not checked.
+    /// must keep the node alive. A node with an empty write set gets a second
+    /// entry under its storage view's root (`Node::bare_root`, R43), checked
+    /// here once because `lookup` never upgrades a live entry it does not
+    /// return (the node is immutable, so the answer cannot change); `advance`
+    /// and the dead-link sweep remove both entries together. Returns `()` and
+    /// may grow the index. Call once per new node: duplicate registrations
+    /// are not checked.
     pub fn register(&mut self, node: &NodeRef<K, V, C, P, S>) {
         self.live.retain(|(_, _, weak)| weak.strong_count() > 0);
-        self.live.push((node.root(), node.height(), Arc::downgrade(node)));
+        let weak = Arc::downgrade(node);
+        if let Some(bare) = node.bare_root() {
+            self.live.push((bare, node.height(), weak.clone()));
+        }
+        self.live.push((node.root(), node.height(), weak));
     }
 
     /// Install owned `node` as the newest committed head. `revisions` is the

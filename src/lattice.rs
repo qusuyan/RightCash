@@ -85,13 +85,6 @@ impl LatticeAccumulator {
         }
         hasher.finalize().into()
     }
-
-    /// Return whether all lanes are zero; this does not count or track items.
-    /// Adding then removing the same items restores zero. `MemoryStorage` uses
-    /// this condition to select `EMPTY_ROOT`.
-    pub fn is_zero(&self) -> bool {
-        self.lanes.iter().all(|l| *l == 0)
-    }
 }
 
 #[cfg(test)]
@@ -114,7 +107,7 @@ mod tests {
         z.add_fields(&a);
         assert_eq!(x.digest(), z.digest());
         x.remove_fields(&a);
-        assert!(x.is_zero());
+        assert_eq!(x.digest(), LatticeAccumulator::new("test").digest());
     }
 
     #[test]

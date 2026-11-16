@@ -1,6 +1,15 @@
 # right_cash design
 
-Status: DESIGN v36 (2026-11-03). Clean-shutdown persistence and recovery
+Status: DESIGN v37 (2026-11-16). R42 removes the empty-root sentinel:
+`New` accepts an engine that already holds a chain's state, and every
+combined root, the initial node's included, is the full preimage over the
+engine's root (§1, §7.3). Engines report their empty state in their own
+convention (§10). R43: `Revision(root)` also resolves a node whose write
+set is empty by its storage view's root, so the first block after an
+opt-in finds the initial node by the engine's root (§8). See §14
+"Empty-root sentinel removed".
+
+Previously DESIGN v36 (2026-11-03). Clean-shutdown persistence and recovery
 save the latest committed snapshot and restore it against matching storage
 (R41, §12.6). Watermark semantics corrected by R39 (§6.2):
 the high watermark is local and starts precomputation only; actual eviction
@@ -159,11 +168,12 @@ v0 limitations (explicit, consensus-relevant)
   to one initial batch. `Close` can checkpoint the latest committed state to
   `Local::snapshot_path`; `Recover` restores it against the same storage
   (§12.6). Historical revisions and crash recovery remain unsupported.
-  `New` rejects an engine that already has committed
-  state (`EngineNotFresh`), because the adapter keys `Initialized()` on
-  `Root() != EmptyRoot` and would otherwise re-run genesis over it. Reopening
-  after a successful close uses `Recover`; crash recovery and state sync need
-  a separate durability protocol (§12.6).
+  `New` accepts an engine that already has committed state (R42): a chain
+  may opt in to right_cash after running on the engine alone, and the
+  engine's state is then what the set's misses read. The initial node's
+  root is a full combined root over that state (§7.3); there is no
+  empty-root sentinel. Reopening after a successful close uses `Recover`;
+  crash recovery and state sync need a separate durability protocol (§12.6).
 - Roots are **history-bound**: they include the block height and the
   policy's state digest (its eviction order, by write height for the v0
   policies, §6.1, §7.3), so the same key-value contents reached by different
@@ -221,7 +231,7 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 
 | Symbol | Behaviour in right_cash |
 |---|---|
-| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `RightCash::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes right_cash's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; `EngineNotFresh` if the engine already has committed state (§1); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
+| `New(dir, NodeHashAlgorithm, opts...)` | Opens the storage engine (all firewood/qmdb options pass through to it; for `MemoryStorage` the directory and hashing algorithm are accepted and ignored) and a write set. The Rust constructor is `RightCash::new(config, storage, set)`; it takes the complete `Snapshot`, whose entries, policy, scheme and capacity stay together, and validates that the set capacity matches configuration. Empty or seeded initial sets are supported (§4). New options: `WithSetCapacity(n)` (consensus) and `WithLowWatermark(n)` (handed to the v0 policies, whose parameter it is; a policy without one ignores it, §6.2), `WithEvictionPolicy(name)` (default `lru-write`, §6.1), `WithCommitmentScheme(name)` (default `lthash`), `WithStorageEngine(name)` (default `firewood`), and the local `WithHighWatermark(n)` (precomputation threshold only, §6.2), `WithSpeculation(bool)`, `WithSpeculationRounds(n)`, `WithSpeculationMinStep(n)`, `WithSpeculationMargin(n)` (§9.2). `WithRevisions(K)` sizes right_cash's K-ring; the engine is opened with a window of `K × rounds` when speculation is on and the engine commits chain links separately (firewood), else `K` (§8, §10). The Rust core is statically generic (§13); the names select one of a fixed list of monomorphizations behind an enum, and an unknown combination is rejected at `New`, as are (`InvalidConfig`) `capacity = 0`, `revisions < 2` (§8), speculation on an engine whose root is not a state function (§9.3), `rounds = 0` or `min_step = 0` with speculation on, and an engine window smaller than the one above; the engine may already hold committed state (§1, R42); a policy whose parameters could leave the set over capacity is refused (`InvalidConfig` from `EvictionPolicy::validate`, §6.1: for the v0 policies `low_watermark > capacity` or a high watermark outside `[low_watermark, capacity]`); the `apply` assert of §6.2 stays as the backstop for other policies. Default `revisions` is 128. |
 | `Recover` (Rust) | `RightCash::recover(config, storage, vc, policy)` restores `Local::snapshot_path` with matching, reopened storage. Validates the file and reconstructed root, installs the latest committed node, and starts fresh local speculation. See §12.6. |
 | `Update(batch)` / `UpdateWithMetadata` | `Propose` + `Commit` in one call. |
 | `Propose(batch)` / `ProposeWithMetadata` | Copies the parent's set and applies the batch to the copy (§4), the policy evicts if over capacity (§6.1), creates the storage proposal for the evicted writes, returns a `Proposal` whose `Root()` is known immediately (§8). `Root()` is a single 32-byte commitment combining the set commitment, the policy digest and the storage root (§7.3); none of them is exposed separately. Metadata is root-affecting (it enters the preimage; `None` and `Some(empty)` are distinct, as in `qmdb-ffi`) and is also carried by the node's own storage proposal when one exists (on the speculative path, the worker's final proposal; early steps never carry metadata, §9.1). |
@@ -231,8 +241,8 @@ them: `New`, `Database`, `Proposal`, `Revision`, `BatchOp`, `Put`, `Delete`,
 | `Proposal.Drop` | Releases the handle's reference; the node, its snapshot and its storage proposal are freed when the last reference goes (the K-ring may hold one, §8; the precomputation refers to its target weakly, and the worker's chain keeps the steps, and through them the target's pinned view, alive until the next retarget or `Close`, §9.2). |
 | `Prefetch(keys)` on `Database`, `Proposal`, `Revision` | **New (R14).** Hint that execution reading through this view is writing `keys`. The keys go to the policy's `hint_writes` when the node is the precomputation's target, retarget it first when the node is a live child of the target (or, with no live target, the head or a live child of it), and otherwise do nothing (§9.2; no engine warming, R26: the steps are the warming, §9.4). Returns after the policy call: the engine work runs on the instance's worker thread (R17, §9.2). A writer operation in Rust (`RightCash::prefetch(&mut self, view, keys)`, R19) and a writer call on the database handle in the C ABI, which takes the writer mutex (threading contract below): the hint writes the target's policy. Advisory: a wrong hint costs work, never correctness. |
 | `Get` | The head's snapshot, then its pinned storage view (§5). The head is resolved under the registry lock, one hold of about 15 ns (§10); the set lookup takes no lock, the storage read the adapter's handle read guard (§10 (e)). |
-| `Root` | Combined root of the committed state (§7.3). `EmptyRoot` is the Ethereum empty-root constant, as in `qmdb-ffi`, reported for an empty height-zero initial set; a seeded set has an authenticated root immediately (§4), so the empty-start adapter's genesis idiom (`Initialized()`, `Revision(EmptyRootHash)`) keeps working. |
-| `Revision(root)` / `LatestRevision` | Resolves the last K committed revisions, then live proposals, under one registry hold; in Rust the result is the same `Handle` type a `Propose` returns (§8). `ErrRevisionNotFound` for an unknown root; `ErrRevisionStale` from `Revision.Get` only when its pinned storage view has left the engine's window: every node owns its snapshot, so set reads never go stale, and an orphan reads its own copy exactly, however many commits later (§5, §8). |
+| `Root` | Combined root of the committed state (§7.3), the initial node's included: it covers the initial set and the engine's committed root, empty or not (R42). The Go `EmptyRoot` symbol stays exported for R1, but right_cash never reports it, so the adapter's genesis idiom (`Initialized()` as `Root() != EmptyRoot`) does not carry over; how the adapter port decides initialization is a milestone-4 question (§12.6). Looking the initial node up by the engine's root, as the first block after an opt-in does, is `Revision`'s (R43, below). |
+| `Revision(root)` / `LatestRevision` | Resolves the last K committed revisions, then live proposals, under one registry hold; in Rust the result is the same `Handle` type a `Propose` returns (§8). A node answers to its combined root and, while its write set is empty, to its storage view's root, the engine's state without right_cash (R43, §8): after an opt-in (R42) the first block's parent, named by the engine's root, resolves to the initial node, whose handle reports its combined root. `ErrRevisionNotFound` for an unknown root; `ErrRevisionStale` from `Revision.Get` only when its pinned storage view has left the engine's window: every node owns its snapshot, so set reads never go stale, and an orphan reads its own copy exactly, however many commits later (§5, §8). |
 | `Prune`, `GatherMetrics`, `Gatherer`, `StartMetrics*` | Pass-through / composition. |
 | `Close(ctx)` | Mirrors `qmdb-ffi`: the Go layer waits for its outstanding `Proposal`/`Revision` handles until `ctx` expires (its own keep-alive count, as in `qmdb-ffi`'s `keepalive.go`), then returns `ErrActiveKeepAliveHandles`; otherwise it calls the Rust `RightCash::close(&mut self)`, a writer operation, which sets the closing flag (`Propose`, `Commit` and `Update` report `Closed` from then on; hints are no-ops), drops the worker's channel and joins it (the step being built finishes, the requests it had already drained are handled, which may build one more step, and nothing is answered, §9.2; the thread's chain, the only speculative engine proposals, drops with it; the writer holds none), and closes the engine through the writer's exclusive reference, which succeeds because committed proposals and revisions do not pin it and reports `ActiveHandles` if a Rust caller still holds a handle to an uncommitted proposal with its own storage proposal (§10 item 6). Reads through handles and `Reader`s keep working afterwards, retained revisions included (a snapshot is memory, a committed engine view stays readable; the Rust side keeps no closed flag for reads, R20; the registry is released with the instance, R22), and `Root` keeps answering with the last committed root. With `Local::snapshot_path`, saves the committed head through the ordered checkpoint protocol in §12.6. Successful close is idempotent; a poisoned instance can close storage but cannot publish a checkpoint. |
 | `BatchOp`: `Put`, `Delete`, `PrefixDelete` | `Put`/`Delete` land in the set. `PrefixDelete` is rejected by `Propose` (`PrefixDeleteUnsupported`), as QMDB rejects it behind qmdb-ffi: a bounded set cannot apply a prefix delete to the keys it does not hold, forwarding it would need a storage proposal and ordering rules of its own, and the adapter never emits it (it bumps storage generations instead; R22). The engines keep supporting the op (§10). |
@@ -285,7 +295,7 @@ the set capacity, the eviction policy with its parameters (the v0 policies'
 low watermark), the commitment
 scheme and the storage engine, which are therefore consensus parameters and must be identical
 on every validator; proposing on a node that can no longer be committed is accepted, its child never commits; `New`
-requires a fresh engine, while `Recover` requires a matching checkpoint;
+accepts an engine with or without committed state, while `Recover` requires a matching checkpoint;
 `Prefetch` is an addition; on firewood the
 engine's read-cache strategy is forced to cache all reads (§9.4), overriding
 `WithReadCacheStrategy`. Speculation and its rounds are local settings.
@@ -302,12 +312,14 @@ reject initial data that exceeds capacity or would be evicted. Thus no seed
 entries disappear without a corresponding storage proposal.
 
 A nonempty initial set has height 1 and the same authenticated root as one
-initial batch with no metadata on fresh storage. Empty initialization keeps
-height 0 and `EMPTY_ROOT`. The initial node has no parent; it enters the
+initial batch with no metadata that evicts nothing, over the engine's
+committed state. Empty initialization keeps height 0. Either way the initial
+root is the full preimage of §7.3 over the engine's committed root, which
+may be any state the engine holds (R42). The initial node has no parent; it enters the
 revision registry directly. Initialization does not count as runtime writes
 or eviction statistics. Root parameters come from the supplied set, and
 prediction marks are cleared because no engine precomputation accompanies it.
-Storage freshness remains required for `New`. `Recover(config, storage, vc,
+`Recover(config, storage, vc,
 policy)` reconstructs a saved set with its original height and policy state
 instead of treating its entries as a new batch (§12.6).
 
@@ -411,14 +423,16 @@ a mutable base would take.
 - **Capacity is counted in entries**, not bytes, in v0: `entries.len()`,
   so a byte-based capacity can replace it later (§12.8).
 - **Height as the clock.** Policies and the commitment never read wall-clock
-  time. `height` is the only notion of time: the genesis node (nothing
-  committed) has height 0 and every proposal is `parent.height + 1`. It counts
-  proposals since genesis; a populated initial set is treated as the first
+  time. `height` is the only notion of time: the initial node (nothing
+  committed through right_cash) has height 0 and every proposal is
+  `parent.height + 1`. It counts proposals since the initial node, not chain
+  blocks; a populated initial set is treated as the first
   batch and starts at height 1 (§1). Recovery must restore historical state
-  separately (§12.6). The chain's genesis block is itself committed as a
-  proposal, so under the v0 assumption (fresh start, one proposal per block)
-  a block at chain height `h` sits at right_cash height `h + 1`; the adapter's
-  own height bookkeeping is Go-side and never reads this value. The `ffi`
+  separately (§12.6). On a chain that starts on right_cash, the genesis
+  block is itself committed as a proposal, so with one proposal per block a
+  block at chain height `h` sits at right_cash height `h + 1`; a chain that
+  opts in later (R42) counts from its first right_cash block instead. The
+  adapter's own height bookkeeping is Go-side and never reads this value. The `ffi`
   interface does not pass a height. Keys written at the same height
   tie-break by key bytes in eviction order (§6.1).
 - **Generic key and value types.** The `ffi` interface carries both keys and
@@ -812,8 +826,7 @@ state. It is computed when the node is built and is what `Root()` returns and
 what `Revision(root)` is keyed by.
 
 ```
-root(node) = EMPTY_ROOT                                         if node.height == 0
-           = SHA-256( "right_cash/v1"                                   (raw bytes, no length prefix)
+root(node) = SHA-256( "right_cash/v1"                                   (raw bytes, no length prefix)
                     ‖ len ‖ scheme_id ‖ len ‖ policy_name ‖ len ‖ engine_id   (u32 LE length-prefixed)
                     ‖ scheme.params_digest() ‖ policy.params_digest()
                     ‖ capacity                                   (u64 LE: in force at the node, §6.2)
@@ -850,22 +863,33 @@ few hundred microseconds against the 2 ms copy, to measure in milestone 1;
 an incremental accumulator inside the policy replaces it without touching
 the trait or the root if it ever matters, clarification 21).
 `engine_id` includes the engine's consensus parameters: Firewood reports
-`firewood/ethereum` with `ethhash`, otherwise `firewood/merkledb`. Every engine
-reports `EMPTY_ROOT` before its first commit, so an identifier covering only
-the engine name would let different hashing algorithms share roots until the
-first eviction. These identifiers change Firewood-backed roots from the old
-`firewood` identifier starting at the first non-genesis proposal; the root
-encoding and MemoryStorage roots are unchanged. `storage_root` is the
-pinned storage view's root; a proposal without a storage proposal of its own
-reuses its parent's.
+`firewood/ethereum` with `ethhash`, otherwise `firewood/merkledb`. A storage
+root does not name the engine or hashing algorithm that produced it, while
+that algorithm decides every later storage root, so an identifier covering
+only the engine name would let different hashing algorithms share combined
+roots whenever their current storage roots coincide. These identifiers
+changed Firewood-backed roots from the old `firewood` identifier at their
+introduction; the root encoding and MemoryStorage roots were unchanged.
+`storage_root` is the pinned storage view's root; a proposal without a
+storage proposal of its own reuses its parent's.
 Both QMDB and firewood report a proposal's root at propose time, so the
-combined root is available before commit. `EMPTY_ROOT` means "nothing
-committed yet" on the empty-start path: the height-0 node. A populated
-initial set starts at height 1 with the same root as one initial batch and
-uses that root for revision lookup immediately. `Revision(EMPTY_ROOT)` resolves
-to the empty initial node only when one was supplied,
-while that node is in the K-ring (the adapter needs it only at genesis), and
-returns `RevisionNotFound` once it is retired. A node keeps its root and
+combined root is available before commit.
+
+There is no height-0 case and no empty-root sentinel (R42). The initial
+node's root is the same hash, at its own height, over the initial set and the
+engine's committed root, so it authenticates whatever the engine already
+holds: a chain may opt in to right_cash after running on the engine alone
+(§1). What an engine reports for its own empty state is the engine's
+convention, not right_cash's (§10). A populated initial set starts at height
+1 with the same root as one initial batch, an empty one at height 0, and
+either uses its root for revision lookup immediately. `Revision(root)`
+resolves the initial node while it is in the K-ring and returns
+`RevisionNotFound` once it is retired. The root is never passed through:
+an empty set over the engine's root R still has a combined root distinct
+from R. What the switch needs instead is in the lookup (R43, §8): a node
+whose write set is empty also answers to its storage view's root, so the
+first right_cash block finds its parent, the initial node, by the engine's
+root. A node keeps its root and
 metadata hash so checkpoint recovery can verify the preimage (§12.6).
 A proof (§7.4, milestone 5) still takes the metadata bytes from the caller
 and recomputes the preimage with `Terms::combine`.
@@ -909,7 +933,8 @@ The **registry** is the one structure the writer changes and readers read: the
 newest entry is the **head** (the committed set is the head's snapshot; there
 is no separate head field, no order list and no copy of K, which `Commit`
 passes in), the **live index** (a flat list of (root, height, weak link) triples
-for the live proposals, Drop below), and nothing else (the statistics are
+for the live proposals, Drop below; a proposal whose write set is empty has a
+second triple under its storage view's root, R43), and nothing else (the statistics are
 atomics beside the speculation counters, §9.5). It sits behind the registry
 mutex (§10). The live index exists for one reason: `Revision(root)` must
 resolve a live proposal's root, as `qmdb-ffi`'s `Database.Revision` and
@@ -1035,6 +1060,24 @@ closed flag.
   same root and the adapter may drop one of them, hence triples rather than
   unique keys, and a flat list because it holds a few entries. Retiring a node from the ring removes its root, and the window rule
   retires an equal-root live twin at the same commit (sweep rule above).
+- **Lookup by storage root (R43).** A node whose write set is empty is
+  exactly the engine's state at its storage view, so it also answers to that
+  view's root, in the same order. On a chain that opted in over an engine
+  with state (R42), the first right_cash block names its parent by the
+  engine's root, and this resolves it to the initial node. Roots themselves
+  stay combined (§7.3): the handle's `Root` is the combined root, and
+  nothing is passed through. In the ring the check is an emptiness test and,
+  only for an empty set, one more root compare per entry, both O(1) on a node
+  the ring holds. In the live index the same test is made once, at
+  `register`, which adds the second triple: a lookup never upgrades a live
+  entry it does not return, since that temporary could be the last strong
+  reference and drop the node under the registry hold (§10); the node is
+  immutable, so the answer cannot change. Several nodes can share a storage
+  root with an empty set (an empty block over the initial node, say); they
+  read identically, and the scan order picks the committed one before a
+  live one and the newest committed one first, as for combined roots. A
+  nonempty set never answers to its storage root, tombstones included,
+  since they shadow storage.
 - **Handles.** The Rust core has one handle type over a node, `Handle`,
   returned by `Propose` and by `Revision(root)` alike (the Go package keeps
   qmdb-ffi's two names, `Proposal` and `Revision`, over it): `Get`, `Root`,
@@ -1477,7 +1520,7 @@ pub trait StorageEngine<K, V>: Send + Sync + 'static {
     const ROOT_IS_STATE_FUNCTION: bool;                 // required for speculation (§9.3)
     const COMMITS_CHAIN_LINKS_SEPARATELY: bool;         // each proposal of a chain is its own commit (firewood)
     fn revisions(&self) -> usize;                       // engine window, for the §8 check
-    fn root(&self) -> Hash;                             // `New`'s freshness check (§1); the benchmark baseline
+    fn root(&self) -> Hash;                             // `Recover`'s storage check (§12.6); the engine's own convention, empty state included
     fn head(&self) -> Result<Self::Proposal>;           // committed handle at the committed root (item 7); `head()?.propose(..)` proposes on the committed state
     fn prune(&self) -> Result<()> { Ok(()) }            // pass-through hook, default no-op
     fn close(&mut self) -> Result<()> { Ok(()) }        // exclusive: the writer owns the engine (R19)
@@ -1490,7 +1533,7 @@ revision type, no engine-level read, propose or revision lookup (R20 removed
 them with the `is_committed` probe and the proof stubs; `head()?.propose(..)`
 is the one way to propose on the committed state, and the benchmark baseline
 uses it too; milestone 5 adds `prove` and `verify_proof`, §7.4). A node's pinned storage view is always a proposal handle (`Arc<S::Proposal>`,
-committed or not; the genesis node's is `head()`), so there is one dispatch
+committed or not; the initial node's is `head()`), so there is one dispatch
 for proposing on a view, the handle's own `propose`, and neither the worker
 nor the readers hold a reference to the engine: the writer owns it and closes
 it through `&mut self` (R19).
@@ -1571,10 +1614,12 @@ provide:
    storage proposal gets `ActiveHandles` from the engine (§3). The database file
    stays open while any committed view lives, so reopening the same directory
    in-process needs the instance dropped (the Go `Close` drops it).
-7. `head` returns a committed handle at the engine's committed root
-   (`EMPTY_ROOT` on a fresh engine), readable like any committed proposal and
-   proposable per item 4. It is the genesis node's pinned view, which is what
-   makes every pinned view a proposal handle (above).
+7. `head` returns a committed handle at the engine's committed root, whether
+   the engine is empty or already holds state (R42), readable like any
+   committed proposal and proposable per item 4. It is the initial node's
+   pinned view, which is what makes every pinned view a proposal handle
+   (above). Each engine reports its empty state in its own convention;
+   right_cash has no shared empty-root constant.
 
 **Firewood** (the backend of record). Its root is the Merkle trie root of
 the stored state (`ROOT_IS_STATE_FUNCTION = true`); a proposal is an
@@ -1629,8 +1674,9 @@ read-through, the same handle shapes as the firewood adapter (the parent
 link inside the handle's lock, the committed-handle `propose` with its
 before-and-after check, `head`), and an optional **synthetic per-op
 latency** knob so benchmarks can show what speculation buys against a slow
-engine. A fresh engine reports
-`EMPTY_ROOT`, and so does an emptied one (the root is a function of state).
+engine. Every state's root is the accumulator's digest, the empty one
+included: a fresh engine reports the digest of the zero accumulator, and so
+does an emptied one (the root is a function of state).
 
 **Firewood backend** (implemented, milestone 0, feature `firewood`;
 `src/storage/firewood.rs`). The mechanics above are realised as: (a) the
@@ -1667,8 +1713,11 @@ the worker never blocks `F`, a plain proposal or a read on the same handle
 (§9.2, R17); a contract test exercises it with concurrent proposes on one
 handle (results, not overlap: §9.3 test 6 measures the overlap), and the
 memory model carries the same lock shape so that test runs on both engines;
-(f) `head` wraps the committed revision, or the empty state of a fresh
-engine, as a committed handle (item 7). The memory model also counts its
+(f) `head` wraps the committed revision, or the empty state of an empty
+engine, as a committed handle (item 7); an empty trie reports Firewood's own
+root under `ethhash` (Ethereum's empty-trie root) and, having none in
+MerkleDB mode, the zero hash, as Firewood's Go FFI reports it (`EmptyRoot`,
+the zero `Hash`), which is also what `root` reports after `close`. The memory model also counts its
 live uncommitted proposals so its `close` reports `ActiveHandles` like the
 firewood adapter's (item 6), fails the oldest uncommitted handle of a chain
 whose commit is `NotLatest` (the failure half of item 1: firewood commits
@@ -1924,10 +1973,22 @@ the paths in situ.
 6. **Clean-shutdown persistence and recovery (R41).**
    `Local::snapshot_path: Option<PathBuf>` selects a checkpoint file;
    `None` retains in-memory operation and is the benchmark default.
-   `New(config, storage, snapshot)` still initializes fresh storage and refuses
-   an existing checkpoint file. `Recover(config, storage, vc, policy)` opens
+   `New(config, storage, snapshot)` starts right_cash in front of the engine
+   as it is, empty or holding a chain's earlier state (R42), and refuses an
+   existing checkpoint file. `Recover(config, storage, vc, policy)` opens
    the saved committed state after the caller reopens the matching engine
    without truncation. It never silently falls back to empty initialization.
+   A checkpoint of the initial node is checked like any other: its combined
+   root covers the engine's root, so only that engine state recovers it.
+
+   Opting in to right_cash is a consensus change for the chain: from the
+   first right_cash block on, header roots are combined roots, and the last
+   earlier block's root is the engine's. `Revision` of that engine root
+   resolves to the initial node (R43, §8), so the first block finds its
+   parent as any other does. The adapter port (milestone 4) still has to
+   decide `Initialized()` without the `Root() != EmptyRoot` idiom, and must
+   not expect the handle's `Root` to equal the root it asked for: it is the
+   initial node's combined root.
 
    A checkpoint contains capacity, height, sorted keys and value/tombstone
    records, policy consensus state, scheme/policy/engine identifiers and
@@ -2312,7 +2373,7 @@ the paths in situ.
 right_cash/
   Cargo.toml                  workspace root; lib (rlib; milestone 4 adds staticlib), features: firewood, ethhash
   src/lib.rs                  RightCash<K, V, C, P, S> (the writer, &mut self) and Reader, both over Arc<Shared>; Config, Stats
-  src/types.rs                Key/Value bounds, Hash, Digest, EMPTY_ROOT, BatchOp<K, V>, Error
+  src/types.rs                Key/Value bounds, Hash, Digest, BatchOp<K, V>, Error
   src/set.rs                  Snapshot (the whole set at one node: sorted records, value arena) and its one-pass batch application, Entry<V>, EntryRef, Entries
   src/policy/{mod,fifo,lru_write}.rs   EvictionPolicy (writes / hint_writes / predicted / reset_hints / validate / state_digest), per-policy prediction state and reconciliation, split_order, merge_index, order_digest, params_digest, validate_watermarks; the v0 policies on sorted arrays, each with its own watermarks
   src/vc/{mod,lthash,merkle,merkle_blake3,rehash}.rs   VectorCommitment (commitment is handed the entries, R34), the entry item's fields; lattice, sparse Merkle reference, bottom-up BLAKE3 Merkle, whole-set rehash
@@ -4083,3 +4144,71 @@ Firewood round trips pass with both MerkleDB and Ethereum hashing, including
 two successive restarts and reads of evicted values. Existing close regressions
 also pass. Clippy, formatting, and a build without Firewood were checked;
 the full unit suite and performance experiments were not rerun.
+
+### Empty-root sentinel removed (2026-11-16)
+
+R42 (clarification 39): a chain may opt in to right_cash after running on its
+storage engine alone, so right_cash must not assume an empty engine. The
+`EMPTY_ROOT` constant and the `EngineNotFresh` error are gone, and so is the
+height-0 case of the root (§7.3): the initial node's root is the same
+SHA-256 preimage as every other node's, over the initial set and the
+engine's committed root. `New` accepts an engine with committed state (§1,
+§3, §4). A checkpoint at height 0 needs no special storage check: its root
+binds the storage root, and the engine's root is checked against the file as
+at any height (§12.6). Engines report their empty state in their own
+convention (§10): `MemoryStorage` the digest of its zero accumulator
+(`LatticeAccumulator::is_zero`, which existed only to select the sentinel,
+is removed), Firewood its own root under `ethhash` (Ethereum's empty-trie
+root, the old constant's bytes) and, having none in MerkleDB mode, the zero
+hash, which is what Firewood's Go FFI reports.
+
+Roots that change: every initial node's; and, on `MemoryStorage` and
+MerkleDB Firewood, every node whose pinned storage view is still empty (no
+eviction yet). Firewood `ethhash` roots after the initial node are
+unchanged; the preimage encoding and domain are unchanged. Checkpoints
+written before this change at height 0, or on `MemoryStorage` or MerkleDB
+Firewood before the first eviction, are refused on recovery (`InvalidSnapshot`: reconstructed
+root or storage root mismatch), never misread.
+
+Alternative not taken: the initial node's root could have passed the
+engine's root through unchanged (generalizing the sentinel, which was an
+empty engine's root), so the last pre-right_cash block root would resolve to
+the initial node with no adapter change. It was rejected because it keeps a
+height-0 case whose root binds none of the consensus parameters, against
+the consensus-state rule (§1) and the opaque-root non-goal (§1); the owner
+confirmed it (clarification 40). The lookup half of that alternative is
+kept instead, as R43 (below). The remaining adapter consequence, its own
+`Initialized()` test, is recorded for milestone 4 (§12.6, `docs/TODO.md`).
+
+Lookup by storage root (R43, clarification 40). The first right_cash
+block's parent is the chain's last earlier block, whose root is the
+engine's; right_cash's own root for that state combines it with an empty
+set and policy state. `Revision(root)` therefore also resolves a node whose
+write set is empty by its storage view's root (`Node::bare_root`, §8), for
+every node, not just the initial one: a later block that evicts its whole
+set (low watermark 0) answers the same way. Ring nodes are checked at
+lookup (an emptiness test, then one root compare); live nodes get a second
+live-index entry at `register`, because a lookup that upgraded every live
+entry to inspect it could drop a node under the registry hold (§10).
+Roots, the handle's `Root` included, stay combined.
+
+Tests: the engine contract compares against each engine's own fresh root
+instead of the constant; a new Firewood test pins the adapter's empty-trie
+root in both hash modes and after `close`; `new_opens_in_front_of_an_engine_with_state`
+opens over a populated `MemoryStorage`, reads through to it, checks that the
+initial root differs from the same set over an empty engine, and evicts on
+top of it against a reference map; a new checkpoint test recovers an initial
+node over engine state only against that same state. For R43, that test
+also builds the first block on `revision(engine_root)`, checks that the new
+head (same storage view, nonempty set) does not answer to the engine's root
+while the initial node does, and that the root stops resolving once the
+initial node retires; the fresh-instance suite checks the lookup over an
+empty engine; and `revision_by_storage_root_requires_an_empty_set` covers a
+later node that evicts its whole set: found live through the second index
+entry, not by a nonempty child over the same view, gone once dropped, then
+found in the ring once committed. `cargo test` passes in all three CI
+configurations (all features: 96; default features, MerkleDB Firewood: 96;
+no default features: 87; plus the README doctest), with Rust 1.94;
+`cargo fmt --check` and Clippy without Firewood are clean.
+Benchmarks were not rerun: the measured paths are unchanged, and the
+benchmark's write-set target still truncates its database.

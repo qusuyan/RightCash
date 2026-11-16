@@ -398,9 +398,10 @@ fn build_target(args: &Args) -> Result<Box<dyn Target>, Box<dyn Error>> {
             // `create` starts from scratch; the other baseline workloads run
             // on the database `create` left behind, as in firewood's
             // benchmark, unless `--prefill` builds the rows in-process.
-            // right_cash requires a fresh engine (design §1, §12.6), so the
-            // write-set target always starts from scratch and its workloads
-            // build their rows themselves (`--prefill`, `--warmup-batches`).
+            // The write-set target always starts from scratch and its
+            // workloads build their rows themselves (`--prefill`,
+            // `--warmup-batches`), so its runs stay comparable; right_cash
+            // itself could open over `create`'s database (design §1, R42).
             cfg.truncate = args.test_name == TestName::Create || !g.baseline || g.prefill;
             cfg.revisions = window::<FirewoodStorage>(&config, g.baseline);
             cfg.commit_permits = NonZeroU64::new(g.commit_permits())

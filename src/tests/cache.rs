@@ -3,8 +3,8 @@
 use super::common::*;
 use crate::policy::{EvictionPolicy, Fifo, LruWrite};
 use crate::set::Entry;
-use crate::storage::{MemoryConfig, MemoryStorage, StorageProposal};
-use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash};
+use crate::storage::{MemoryConfig, MemoryStorage, StorageEngine, StorageProposal};
+use crate::types::{BatchOp, Error, Hash};
 use crate::vc::{VectorCommitment, lthash::LtHash, merkle::Merkle, merkle_blake3::MerkleBlake3, rehash::Rehash};
 use crate::{Config, RightCash};
 use std::collections::BTreeMap;
@@ -32,11 +32,29 @@ where
 {
     let cache = open(4, 3, policy, vc);
     let reader = cache.reader();
-    assert_eq!(reader.root(), EMPTY_ROOT);
+    let initial = reader.root();
+    // No sentinel at height 0: the initial node's root is the full preimage
+    // over the engine's root (design §7.3).
+    let head = reader.latest_revision();
+    let snapshot = head.node().snapshot();
+    assert_eq!(
+        initial,
+        cache.terms.combine(
+            4,
+            0,
+            snapshot.commitment(),
+            snapshot.policy_digest(),
+            head.node().storage_view().root(),
+            crate::root::metadata_hash(None),
+        )
+    );
+    assert_eq!(head.root(), initial);
     assert_eq!(reader.get(&k("a")).unwrap(), None);
-    // Genesis resolves while it is in the ring (design §3, §8).
-    assert_eq!(reader.revision(EMPTY_ROOT).unwrap().root(), EMPTY_ROOT);
-    assert_eq!(reader.latest_revision().root(), EMPTY_ROOT);
+    // The initial node resolves while it is in the ring (design §3, §8), by
+    // its combined root and, its set being empty, by the engine's (R43).
+    assert_eq!(reader.revision(initial).unwrap().root(), initial);
+    let engine_root = head.node().storage_view().root();
+    assert_eq!(reader.revision(engine_root).unwrap().root(), initial);
     let stats = reader.stats();
     assert_eq!((stats.height, stats.occupancy, stats.puts), (0, 0, 0));
 }
@@ -48,9 +66,10 @@ where
 {
     let mut cache = open(4, 3, policy, vc);
     let reader = cache.reader();
+    let initial = reader.root();
     let p1 = cache.propose(None, vec![put("a", "1"), put("b", "2")], None).unwrap();
     let r1 = p1.root();
-    assert_ne!(r1, EMPTY_ROOT);
+    assert_ne!(r1, initial);
     // A live proposal reads its own set and resolves by root (design §5, §8).
     assert_eq!(p1.get(&k("a")).unwrap(), Some(k("1")));
     assert_eq!(reader.get(&k("a")).unwrap(), None);
@@ -126,7 +145,7 @@ where
 {
     let mut cache = open(4, 3, policy, vc);
     let reader = cache.reader();
-    let mut roots = vec![EMPTY_ROOT];
+    let mut roots = vec![reader.root()];
     for i in 0..5 {
         roots.push(cache.update(vec![put("k", &i.to_string())], None).unwrap());
     }
@@ -236,7 +255,7 @@ where
 {
     let mut cache = open(4, 3, policy, vc);
     let reader = cache.reader();
-    cache.update(vec![put("a", "1")], None).unwrap();
+    let committed = cache.update(vec![put("a", "1")], None).unwrap();
     assert!(matches!(
         cache.propose(
             None,
@@ -252,7 +271,7 @@ where
     assert!(matches!(cache.propose(None, vec![], None), Err(Error::Closed)));
     // Reads keep working after close (design §3).
     assert_eq!(reader.get(&k("a")).unwrap(), Some(k("1")));
-    assert_ne!(reader.root(), EMPTY_ROOT);
+    assert_eq!(reader.root(), committed);
 }
 
 /// Random-ish blocks of puts and deletes against a reference map: every read
@@ -423,12 +442,12 @@ where
         .update(vec![put("a", "old"), del("b"), put("c", "3"), put("a", "1")], None)
         .unwrap();
     let engine = MemoryStorage::new(MemoryConfig::default());
+    let engine_root = engine.root();
     let mut cache = RightCash::new(speculating(4, 4, 4, 1, 0), engine, set).unwrap();
     let reader = cache.reader();
     assert_eq!(reader.root(), root);
-    assert_ne!(root, EMPTY_ROOT);
     assert_eq!(reader.revision(root).unwrap().root(), root);
-    assert_eq!(reader.latest_revision().node().storage_view().root(), EMPTY_ROOT);
+    assert_eq!(reader.latest_revision().node().storage_view().root(), engine_root);
     assert_eq!((reader.stats().height, reader.stats().occupancy), (1, 3));
     assert_eq!(reader.stats().puts, 0, "initialization is not measured as a write");
     assert_eq!(reader.get(&k("a")).unwrap(), Some(k("1")));
@@ -464,7 +483,7 @@ fn new_validates_supplied_set_capacity_and_empty_genesis() {
     use crate::set::Snapshot;
     let set = Snapshot::empty(LtHash::new(), Fifo::<K>::new(2), 4).unwrap();
     let mut cache = RightCash::new(config(4, 3), MemoryStorage::<K, V>::new(MemoryConfig::default()), set).unwrap();
-    assert_eq!(cache.reader().root(), EMPTY_ROOT);
+    assert_eq!(cache.reader().stats().height, 0);
     assert_eq!(cache.reader().stats().occupancy, 0);
     cache.close().unwrap();
 
@@ -484,7 +503,7 @@ fn new_validates_supplied_set_capacity_and_empty_genesis() {
 }
 
 #[test]
-fn new_rejects_bad_configuration_and_a_used_engine() {
+fn new_rejects_bad_configuration() {
     let engine = || MemoryStorage::<K, V>::new(MemoryConfig::default());
     let bad = |config: Config| new_empty(config, engine(), Fifo::new(2), LtHash::new()).err();
     assert!(matches!(bad(config(0, 3)), Some(Error::InvalidConfig(_))));
@@ -509,21 +528,103 @@ fn new_rejects_bad_configuration_and_a_used_engine() {
     ));
     // The engine keeps fewer revisions than the window needs.
     assert!(matches!(bad(config(4, 1_000)), Some(Error::InvalidConfig(_))));
-    // An engine with committed state.
+}
+
+/// A chain may opt in to right_cash after running on the engine alone
+/// (design §1): `new` opens in front of an engine with committed state, the
+/// set's misses read that state, the initial root binds the engine's root,
+/// and evictions land on top of it.
+#[test]
+fn new_opens_in_front_of_an_engine_with_state() {
+    let engine = || MemoryStorage::<K, V>::new(MemoryConfig::default());
     let used = engine();
-    {
-        use crate::storage::{StorageEngine, StorageProposal};
-        used.head()
-            .unwrap()
-            .propose(&[put("a", "1")], None)
-            .unwrap()
-            .commit()
-            .unwrap();
+    let engine_root = used
+        .head()
+        .unwrap()
+        .propose(&[put("old", "x"), put("a", "0")], None)
+        .unwrap()
+        .commit()
+        .unwrap();
+    let mut cache = new_empty(config(2, 3), used, Fifo::new(1), LtHash::new()).unwrap();
+    let reader = cache.reader();
+    let initial = reader.root();
+    assert_eq!(reader.stats().height, 0);
+    assert_eq!(reader.latest_revision().node().storage_view().root(), engine_root);
+    assert_eq!(reader.get(&k("old")).unwrap(), Some(k("x")));
+    // The same empty set in front of a fresh engine has another root.
+    let fresh = new_empty(config(2, 3), engine(), Fifo::new(1), LtHash::new()).unwrap();
+    assert_ne!(initial, fresh.reader().root());
+
+    // The first block's parent is the chain's last block before right_cash,
+    // whose root is the engine's: it resolves to the initial node (R43).
+    let parent = reader.revision(engine_root).unwrap();
+    assert_eq!(parent.root(), initial);
+    assert_eq!(parent.get(&k("old")).unwrap(), Some(k("x")));
+    let first = cache
+        .propose(Some(&parent), vec![put("a", "1"), put("b", "2")], None)
+        .unwrap();
+    drop(parent);
+    cache.commit(first).unwrap();
+    // The new head pins the same engine root, but its set is not empty: the
+    // engine's root still names the initial node, not the head.
+    assert_eq!(reader.latest_revision().node().storage_view().root(), engine_root);
+    assert_eq!(reader.revision(engine_root).unwrap().root(), initial);
+
+    let mut reference: BTreeMap<K, V> = [(k("old"), k("x")), (k("a"), k("1")), (k("b"), k("2"))].into();
+    for batch in [
+        vec![put("c", "3"), del("old")],
+        vec![put("d", "4"), put("e", "5")],
+        vec![put("f", "6"), del("a")],
+    ] {
+        for op in &batch {
+            match op {
+                BatchOp::Put { key, value } => reference.insert(key.clone(), value.clone()),
+                BatchOp::Delete { key } => reference.remove(key),
+                BatchOp::PrefixDelete { .. } => unreachable!(),
+            };
+        }
+        cache.update(batch, None).unwrap();
+        for key in ["old", "a", "b", "c", "d", "e", "f"] {
+            assert_eq!(reader.get(&k(key)).unwrap(), reference.get(&k(key)).cloned(), "{key}");
+        }
     }
-    assert!(matches!(
-        new_empty(config(4, 3), used, Fifo::new(2), LtHash::new()).err(),
-        Some(Error::EngineNotFresh)
-    ));
+    assert!(reader.stats().total_evictions > 0);
+    assert_ne!(reader.latest_revision().node().storage_view().root(), engine_root);
+    // K = 3: the initial node has left the ring, and no other node has an
+    // empty set over the engine's old root.
+    assert!(matches!(reader.revision(engine_root), Err(Error::RevisionNotFound)));
+    cache.close().unwrap();
+}
+
+/// R43 holds for every node, not only the initial one: a node whose write
+/// set is empty answers to its storage view's root, live or committed, and a
+/// nonempty set over the same view never does.
+#[test]
+fn revision_by_storage_root_requires_an_empty_set() {
+    // A low watermark of 0: an overflowing block evicts the whole set.
+    let mut cache = open(2, 3, Fifo::new(0), LtHash::new());
+    let reader = cache.reader();
+    let batch = || vec![put("a", "1"), put("b", "2"), put("c", "3")];
+    let emptied = cache.propose(None, batch(), None).unwrap();
+    assert!(emptied.node().snapshot().is_empty());
+    let storage_root = emptied.node().storage_view().root();
+    assert_ne!(storage_root, emptied.root());
+    // Live: found through the live index's second entry.
+    let found = reader.revision(storage_root).unwrap();
+    assert_eq!(found.root(), emptied.root());
+    assert_eq!(found.get(&k("b")).unwrap(), Some(k("2")));
+    drop(found);
+    let child = cache.propose(Some(&emptied), vec![put("d", "4")], None).unwrap();
+    assert_eq!(child.node().storage_view().root(), storage_root);
+    assert_eq!(reader.revision(storage_root).unwrap().root(), emptied.root());
+    // Dropped uncommitted: gone with its combined root.
+    drop(child);
+    drop(emptied);
+    assert!(matches!(reader.revision(storage_root), Err(Error::RevisionNotFound)));
+    // Committed: found in the ring.
+    let root = cache.update(batch(), None).unwrap();
+    assert_eq!(reader.revision(storage_root).unwrap().root(), root);
+    cache.close().unwrap();
 }
 
 #[cfg(feature = "firewood")]
@@ -540,7 +641,9 @@ fn firewood_hashing_algorithm_is_committed_before_eviction() {
     .unwrap();
     let node = cache.propose(None, vec![put("a", "1")], None).unwrap();
     let snapshot = node.node().snapshot();
-    assert_eq!(StorageProposal::<K, V>::root(&**node.node().storage_view()), EMPTY_ROOT);
+    // Nothing evicted yet: the node still pins the engine's committed root.
+    let storage_root = StorageProposal::<K, V>::root(&**node.node().storage_view());
+    assert_eq!(storage_root, StorageEngine::<K, V>::root(&cache.storage));
     let mut terms = cache.terms.clone();
     let expected_id = if cfg!(feature = "ethhash") {
         "firewood/ethereum"
@@ -554,7 +657,7 @@ fn firewood_hashing_algorithm_is_committed_before_eviction() {
             snapshot.height(),
             snapshot.commitment(),
             snapshot.policy_digest(),
-            EMPTY_ROOT,
+            storage_root,
             crate::root::metadata_hash(None),
         )
     };

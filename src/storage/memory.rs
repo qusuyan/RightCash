@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 
 use crate::lattice::LatticeAccumulator;
 use crate::storage::{StorageEngine, StorageProposal};
-use crate::types::{BatchOp, EMPTY_ROOT, Error, Hash, Key, Result, Value};
+use crate::types::{BatchOp, Error, Hash, Key, Result, Value};
 
 const TAG: &str = "right_cash/memory-storage";
 
@@ -101,11 +101,15 @@ struct State<K, V> {
 }
 
 impl<K: Key, V: Value> State<K, V> {
+    /// The empty state. Its root is the digest of the zero accumulator, like
+    /// every other state's: the root is a function of the state, so an
+    /// emptied engine reports the same root as a fresh one.
     fn empty() -> Self {
+        let acc = LatticeAccumulator::new(TAG);
         Self {
             map: PersistentMap::new(),
-            acc: LatticeAccumulator::new(TAG),
-            root: EMPTY_ROOT,
+            root: Hash(acc.digest()),
+            acc,
             seq: OnceLock::new(),
         }
     }
@@ -114,7 +118,7 @@ impl<K: Key, V: Value> State<K, V> {
     /// Clone the persistent map and accumulator, then apply puts, deletes, and
     /// prefix deletes; repeated keys therefore use their final operation.
     /// The original state is unchanged and the returned commit sequence is
-    /// unset. Derive the root from the final accumulator (`EMPTY_ROOT` if zero).
+    /// unset. Derive the root from the final accumulator.
     fn apply(&self, batch: &[BatchOp<K, V>]) -> Self {
         let mut map = self.map.clone();
         let mut acc = self.acc.clone();
@@ -140,7 +144,7 @@ impl<K: Key, V: Value> State<K, V> {
                 }
             }
         }
-        let root = if acc.is_zero() { EMPTY_ROOT } else { Hash(acc.digest()) };
+        let root = Hash(acc.digest());
         Self {
             map,
             acc,

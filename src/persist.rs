@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::policy::EvictionPolicy;
 use crate::set::{Entry, EntryRef, Snapshot};
-use crate::types::{Digest, EMPTY_ROOT, Error, Hash, Key, Result, Value};
+use crate::types::{Digest, Error, Hash, Key, Result, Value};
 use crate::vc::VectorCommitment;
 
 const MAGIC: &[u8; 8] = b"AWALSNAP";
@@ -144,8 +144,10 @@ where
         ));
     }
     let metadata_hash = input.array()?;
-    if height == 0 && (storage_root != EMPTY_ROOT || metadata_hash != [0; 32]) {
-        return Err(invalid("nonempty genesis storage or metadata"));
+    // The initial node carries no metadata. Its storage root may be any
+    // engine state (design §1) and is bound by the combined root below.
+    if height == 0 && metadata_hash != [0; 32] {
+        return Err(invalid("metadata on the initial node"));
     }
     let count = usize::try_from(input.u64()?).map_err(|_| invalid("entry count overflows usize"))?;
     if count > capacity || count > input.0.len() / 5 {
