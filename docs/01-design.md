@@ -723,7 +723,10 @@ and marks are local and cannot change victims or roots. The v0 `params_digest`
 hashes only `"right_cash/policy-params" || low_watermark (u64 LE)`. Removing the
 old trigger field changes the root encoding relative to the earlier version;
 old benchmark roots are not a compatibility reference. Validation requires
-`0 <= low_watermark <= high_watermark <= capacity`. Benchmark defaults are
+`0 <= low_watermark <= high_watermark <= capacity`. A low watermark of 0
+empties the set at every evicting block, and an empty set can be looked up
+by its storage root (R43, §8); that may introduce security vulnerabilities
+we did not anticipate, so use at least 1 until §12 item 18 is analysed. Benchmark defaults are
 capacity 10,000, low watermark 70% (7,000), and high watermark 90% (9,000),
 with percentages rounded down. Explicit CLI values override these defaults.
 The library requires an explicit low watermark; callers choose the local high
@@ -1087,7 +1090,9 @@ closed flag.
   read identically, and the scan order picks the committed one before a
   live one and the newest committed one first, as for combined roots. A
   nonempty set never answers to its storage root, tombstones included,
-  since they shadow storage.
+  since they shadow storage. With a low watermark of 0, every evicting
+  block empties its set and answers to its storage root too, which may
+  introduce security vulnerabilities we did not anticipate (§12 item 18).
 - **Handles.** The Rust core has one handle type over a node, `Handle`,
   returned by `Propose` and by `Revision(root)` alike (the Go package keeps
   qmdb-ffi's two names, `Proposal` and `Revision`, over it): `Get`, `Root`,
@@ -2376,6 +2381,37 @@ the paths in situ.
 
    Not a lever: the lattice's per-item cost is compute-bound; the scheme
    stays for large sets, where the whole-set hash loses.
+18. **A low watermark of 0 and the lookup by storage root (R43; not
+   analysed).** Because `Revision(root)` also finds a node by its storage
+   view's root whenever its write set is empty (§8), a low watermark of 0
+   may introduce security vulnerabilities we did not anticipate. With a low
+   watermark of at least 1 the set is empty only at the initial node and at
+   blocks that write nothing right after it: entries leave the set only by
+   eviction, which keeps `low_watermark` of them, and a delete leaves a
+   tombstone. All of those nodes sit over the engine root the chain had
+   before right_cash, the case R43 was made for. A low watermark of 0, which
+   validation accepts (§6.2), empties the set at every evicting block, so
+   ordinary nodes anywhere in the chain become reachable by a bare storage
+   root. That root authenticates the storage contents only, not the height,
+   the consensus parameters, the policy state or the metadata, all of which
+   the combined root binds (§7.3). Consequences we can already name:
+   - a caller that looks up a root it did not take from a right_cash header
+     (an RPC state request, a peer's message) can reach a right_cash node by
+     a root that no header after the switch carries;
+   - several nodes can share an empty set and a storage root (an evicting
+     block and the empty blocks after it, or two branches that reach the
+     same storage state); the lookup then answers by scan order and by what
+     the K-ring still holds, whose size is local (§8), so two validators can
+     resolve the same root to different nodes, and children proposed on
+     them have different roots;
+   - the built-in engines ignore metadata, so nodes that differ only in
+     their metadata are not told apart by their storage root.
+
+   None of this has been analysed further. Until it is, use a low watermark
+   of at least 1. If it matters, the options are to refuse 0 in the v0
+   policies' `validate`, or to restrict the storage-root match to the
+   initial node and the empty blocks over the same engine root; neither is
+   decided.
 
 ## 13. Layout and milestones
 

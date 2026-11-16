@@ -25,7 +25,11 @@ pub struct Fifo<K: Key> {
     /// search checks membership; heights describe order positions, not offsets.
     index: Arc<Vec<(K, u64)>>,
     /// Eviction target (design §6.2), this policy's own parameter: enters
-    /// `params_digest`. Another policy may have none.
+    /// `params_digest`. Another policy may have none. A value of 0 empties
+    /// the set at every evicting block, and a node with an empty set can be
+    /// looked up by its storage root alone (R43, design §8), which may
+    /// introduce security vulnerabilities we did not anticipate: use at
+    /// least 1 until design §12 item 18 is analysed.
     low_watermark: usize,
     /// Local precomputation threshold, defaulting to capacity. Never used
     /// by actual eviction or included in `params_digest`.
