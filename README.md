@@ -123,6 +123,31 @@ Seed 148983689, the same for every row (rerun with `scripts/run_experiments.py -
 Measured on 2026-11-16 at commit `8bd3383` on a GitHub-hosted Linux runner (AMD EPYC 7763 64-Core Processor, 4 vCPUs).
 <!-- BENCHMARK-TABLE:END -->
 
+**The propose tail.** In some runs RightCash
+propose p99 is 60–70 ms instead of under 10 ms. The time is a wait on
+Firewood, not work in RightCash. About every 15 blocks in this
+configuration, Firewood's background persist holds the lock on its node
+cache for tens of milliseconds while it inserts the roughly 64,000 nodes it
+has just written, and until it lets go no other thread can fetch a node
+that is already on disk. A block that evicts needs such nodes for its
+storage proposals, the precomputed ones and the final one built inside
+propose, so a hold that overlaps them can make its propose wait for the
+rest of the hold.
+
+What usually hits the hold first is a retraction. When a block writes a key
+whose eviction RightCash has already sent to Firewood speculatively,
+RightCash takes that write back: it reads the key's original value from
+Firewood and writes it again. In this workload the read lands on the
+propose path (the `reads` phase in `breakdown.csv`). Ideally RightCash
+would only tell the storage engine that the earlier write was a mistake and
+let the engine restore the original value; that restore operation is item 6
+under
+[Firewood-side changes](docs/TODO.md#firewood-side-changes-r15-design-1210).
+It would remove the read but not the whole wait: the same proposal also
+carries new evictions whose trie paths are on disk, and Firewood's own work
+on them takes the same lock. The tail goes away only when the hold itself
+gets shorter.
+
 ## Documentation
 
 - [`docs/00-project-description.md`](docs/00-project-description.md): the requirements.
